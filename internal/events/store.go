@@ -25,6 +25,49 @@ type Query struct {
 	Until    time.Time
 }
 
+// ValidationError reports that an event failed normalization.
+type ValidationError struct{ Reason string }
+
+func (e *ValidationError) Error() string { return e.Reason }
+
+// IsValidationError reports whether err is an event validation failure.
+func IsValidationError(err error) bool {
+	var target *ValidationError
+	return errors.As(err, &target)
+}
+
+// ConflictError reports that an event id clashes with a different event.
+type ConflictError struct{ Reason string }
+
+func (e *ConflictError) Error() string { return e.Reason }
+
+// IsConflictError reports whether err is an id-content conflict.
+func IsConflictError(err error) bool {
+	var target *ConflictError
+	return errors.As(err, &target)
+}
+
+// Normalize applies the same field rules every ingestion path uses: trim
+// surrounding whitespace from strings, lowercase severity, and require a
+// non-empty id, service, and message together with a non-zero instant.
+func Normalize(event Event) (Event, error) {
+	event.ID = strings.TrimSpace(event.ID)
+	event.Service = strings.TrimSpace(event.Service)
+	event.Severity = strings.ToLower(strings.TrimSpace(event.Severity))
+	event.Message = strings.TrimSpace(event.Message)
+	if event.ID == "" || event.Service == "" || event.Message == "" || event.At.IsZero() {
+		return Event{}, &ValidationError{Reason: "event id, service, message, and timestamp are required"}
+	}
+	return event, nil
+}
+
+func byTimeThenID(a, b Event) bool {
+	if a.At.Equal(b.At) {
+		return a.ID < b.ID
+	}
+	return a.At.Before(b.At)
+}
+
 // Store keeps a concurrency-safe, de-duplicated event timeline.
 type Store struct {
 	mu     sync.RWMutex
@@ -37,26 +80,20 @@ func NewStore() *Store {
 }
 
 func (s *Store) Add(event Event) error {
-	event.ID = strings.TrimSpace(event.ID)
-	event.Service = strings.TrimSpace(event.Service)
-	event.Severity = strings.ToLower(strings.TrimSpace(event.Severity))
-	event.Message = strings.TrimSpace(event.Message)
-	if event.ID == "" || event.Service == "" || event.Message == "" || event.At.IsZero() {
-		return errors.New("event id, service, message, and timestamp are required")
+	normalized, err := Normalize(event)
+	if err != nil {
+		return err
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, exists := s.byID[event.ID]; exists {
+	if _, exists := s.byID[normalized.ID]; exists {
 		return errors.New("event id already exists")
 	}
-	s.byID[event.ID] = event
-	s.events = append(s.events, event)
+	s.byID[normalized.ID] = normalized
+	s.events = append(s.events, normalized)
 	sort.SliceStable(s.events, func(i, j int) bool {
-		if s.events[i].At.Equal(s.events[j].At) {
-			return s.events[i].ID < s.events[j].ID
-		}
-		return s.events[i].At.Before(s.events[j].At)
+		return byTimeThenID(s.events[i], s.events[j])
 	})
 	return nil
 }

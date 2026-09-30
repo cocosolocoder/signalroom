@@ -9,14 +9,31 @@ import (
 )
 
 func main() {
-	if len(os.Args) != 2 || os.Args[1] != "demo" {
-		fmt.Fprintln(os.Stderr, "usage: signalroom demo")
-		os.Exit(2)
+	if len(os.Args) < 2 {
+		usage()
 	}
-	if err := runDemo(); err != nil {
+	var err error
+	switch os.Args[1] {
+	case "demo":
+		if len(os.Args) != 2 {
+			usage()
+		}
+		err = runDemo()
+	case "serve":
+		err = runServe(os.Args[2:])
+	default:
+		usage()
+	}
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "signalroom: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+func usage() {
+	fmt.Fprintln(os.Stderr, "usage: signalroom demo")
+	fmt.Fprintln(os.Stderr, "       signalroom serve --addr <address> --data <directory>")
+	os.Exit(2)
 }
 
 func runDemo() error {
