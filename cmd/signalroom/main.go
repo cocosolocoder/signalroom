@@ -1,43 +1,111 @@
 package main
 
 import (
+	"context"
+	"errors"
+	"flag"
 	"fmt"
+	"net"
+	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
+	"github.com/cocosolocoder/signalroom/internal/api"
 	"github.com/cocosolocoder/signalroom/internal/events"
 )
 
 func main() {
-	if len(os.Args) != 2 || os.Args[1] != "demo" {
-		fmt.Fprintln(os.Stderr, "usage: signalroom demo")
+	if len(os.Args) < 2 {
+		usage()
 		os.Exit(2)
 	}
-	if err := runDemo(); err != nil {
-		fmt.Fprintf(os.Stderr, "signalroom: %v\n", err)
-		os.Exit(1)
+	switch os.Args[1] {
+	case "demo":
+		if len(os.Args) != 2 {
+			fmt.Fprintln(os.Stderr, "usage: signalroom demo")
+			os.Exit(2)
+		}
+		if err := runDemo(); err != nil {
+			fmt.Fprintf(os.Stderr, "signalroom: %v\n", err)
+			os.Exit(1)
+		}
+	case "serve":
+		if err := runServe(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "signalroom: %v\n", err)
+			os.Exit(1)
+		}
+	default:
+		usage()
+		os.Exit(2)
 	}
 }
 
-func runDemo() error {
-	store := events.NewStore()
-	base := time.Date(2026, time.October, 1, 10, 0, 0, 0, time.FixedZone("CST", 8*60*60))
-	fixtures := []events.Event{
-		{ID: "evt-001", Service: "gateway", Severity: "critical", Message: "错误率超过阈值", At: base},
-		{ID: "evt-002", Service: "checkout", Severity: "warning", Message: "请求延迟持续升高", At: base.Add(90 * time.Second)},
-		{ID: "evt-003", Service: "gateway", Severity: "info", Message: "值班工程师已确认告警", At: base.Add(3 * time.Minute)},
+func usage() {
+	fmt.Fprintln(os.Stderr, `usage: signalroom <command> [flags]
+
+commands:
+  demo   run the in-memory event timeline demo
+  serve  start the HTTP event ingestion server
+
+serve flags:
+  --addr <addr>  listen address, e.g. :8080 or 127.0.0.1:0
+  --data <dir>   data directory for persistent event storage`)
+}
+
+func runServe(args []string) error {
+	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	addr := fs.String("addr", "", "listen address")
+	data := fs.String("data", "", "data directory")
+	if err := fs.Parse(args); err != nil {
+		return err
 	}
-	for _, event := range fixtures {
-		if err := store.Add(event); err != nil {
-			return err
-		}
+	if *addr == "" || *data == "" {
+		fs.Usage()
+		return errors.New("both --addr and --data are required")
 	}
 
-	fmt.Println("Signalroom 服务可观测与事件响应工作台")
-	fmt.Println("当前事件时间线：")
-	for _, event := range store.Query(events.Query{}) {
-		fmt.Printf("%s  %-8s %-8s %s\n", event.At.Format("15:04:05"), event.Service, event.Severity, event.Message)
+	store, err := events.OpenStore(*data)
+	if err != nil {
+		return err
 	}
-	fmt.Printf("已接入事件：%d，严重事件：%d\n", len(fixtures), len(store.Query(events.Query{Severity: "critical"})))
+	defer store.Close()
+
+	ln, err := net.Listen("tcp", *addr)
+	if err != nil {
+		return fmt.Errorf("listen on %s: %w", *addr, err)
+	}
+
+	srv := &http.Server{
+		Handler:           api.NewServer(store).Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	fmt.Printf("signalroom listening on %s\n", ln.Addr())
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	errCh := make(chan error, 1)
+	go func() {
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errCh <- err
+		}
+		close(errCh)
+	}()
+
+	select {
+	case err := <-errCh:
+		return err
+	case <-ctx.Done():
+		fmt.Println("signalroom shutting down...")
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		return err
+	}
 	return nil
 }

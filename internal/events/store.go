@@ -25,6 +25,41 @@ type Query struct {
 	Until    time.Time
 }
 
+// ErrInvalidEvent is returned when an event fails required-field validation.
+var ErrInvalidEvent = errors.New("event id, service, message, and timestamp are required")
+
+// NormalizeEvent trims free-form string fields, lower-cases severity, and
+// enforces the required-field rules shared by every ingestion path.
+func NormalizeEvent(event Event) (Event, error) {
+	event.ID = strings.TrimSpace(event.ID)
+	event.Service = strings.TrimSpace(event.Service)
+	event.Severity = strings.ToLower(strings.TrimSpace(event.Severity))
+	event.Message = strings.TrimSpace(event.Message)
+	if event.ID == "" || event.Service == "" || event.Message == "" || event.At.IsZero() {
+		return Event{}, ErrInvalidEvent
+	}
+	return event, nil
+}
+
+// EventsEqual reports whether two events are identical after normalization.
+// Timestamps are compared as absolute instants so equivalent RFC3339 offsets
+// compare equal.
+func EventsEqual(a, b Event) bool {
+	return a.ID == b.ID &&
+		a.Service == b.Service &&
+		a.Severity == b.Severity &&
+		a.Message == b.Message &&
+		a.At.Equal(b.At)
+}
+
+// less orders events by absolute time ascending, then by ID ascending.
+func less(a, b Event) bool {
+	if a.At.Equal(b.At) {
+		return a.ID < b.ID
+	}
+	return a.At.Before(b.At)
+}
+
 // Store keeps a concurrency-safe, de-duplicated event timeline.
 type Store struct {
 	mu     sync.RWMutex
@@ -37,12 +72,9 @@ func NewStore() *Store {
 }
 
 func (s *Store) Add(event Event) error {
-	event.ID = strings.TrimSpace(event.ID)
-	event.Service = strings.TrimSpace(event.Service)
-	event.Severity = strings.ToLower(strings.TrimSpace(event.Severity))
-	event.Message = strings.TrimSpace(event.Message)
-	if event.ID == "" || event.Service == "" || event.Message == "" || event.At.IsZero() {
-		return errors.New("event id, service, message, and timestamp are required")
+	event, err := NormalizeEvent(event)
+	if err != nil {
+		return err
 	}
 
 	s.mu.Lock()
@@ -53,10 +85,7 @@ func (s *Store) Add(event Event) error {
 	s.byID[event.ID] = event
 	s.events = append(s.events, event)
 	sort.SliceStable(s.events, func(i, j int) bool {
-		if s.events[i].At.Equal(s.events[j].At) {
-			return s.events[i].ID < s.events[j].ID
-		}
-		return s.events[i].At.Before(s.events[j].At)
+		return less(s.events[i], s.events[j])
 	})
 	return nil
 }
