@@ -240,6 +240,105 @@ members, invalid filters or group-label names, a range needing more than
 group windows in total all return `400` with a non-empty `error` and never a
 partial result. A poisoned store returns `503`.
 
+### POST /incidents
+
+Open an incident. The body is a JSON object with exactly the members `id`,
+`title`, `service`, and `operator`; unknown or duplicate members are
+rejected. String values are trimmed of surrounding whitespace (their case is
+kept) and each must be non-empty afterwards.
+
+`200` returns `{"id","status","version"}` with the initial status `open` and
+version `1`. Re-sending the same `id` with the same content after
+normalization replays the first result (`open`, version `1`), even after the
+incident has evolved; the same `id` with different content is `409`.
+
+```bash
+curl -sS -X POST localhost:8080/incidents \
+  -H 'Content-Type: application/json' \
+  -d '{"id":"INC-1","title":"Checkout outage","service":"checkout","operator":"alice"}'
+```
+
+### POST /incidents/{id}/actions
+
+Advance one incident. Every body carries `action_id`, `operator`,
+`expected_version` (a positive integer), and `action`, plus exactly the
+payload member that action needs. `action_id` must be unique within the
+incident. Actions are:
+
+- `add_note` with `content`.
+- `link_event` with `event_id`; the event must already be ingested, must
+  belong to the incident's service, and must not already be linked. The same
+  event may be linked to several incidents. Linking never modifies the event.
+- `resolve` with a non-empty `reason`.
+- `reopen` with a non-empty `reason`.
+
+While `open`, notes, links, and resolve are accepted. While `resolved`, only
+reopen is; anything else is `409`.
+
+`expected_version` is optimistic concurrency: it must equal the incident's
+current committed version. Two different actions submitted at the same
+version cannot both succeed; the loser gets `409` with the current version:
+
+```json
+{"error":"...","current_version":3}
+```
+
+On success `200` returns `{"incident_id","action_id","version"}`, where
+`version` is the incident's version after the action (the previous version
+plus one). Status, links, and history all advance together.
+
+A request is idempotent on `(incident id, action id)`. Re-submitting a
+successful action with the same normalized content — operator and submitted
+`expected_version` included — returns the first result and adds no history or
+version, even though that expected version is now stale; concurrent identical
+submissions produce exactly one record. The same `action_id` with different
+content is `409`.
+
+Status codes: `400` for a missing field, wrong type, or unknown action;
+`404` when the incident (or, for a link, the event) does not exist; `409`
+for a stale version, a state-machine violation, a cross-service or duplicate
+link, or replayed-but-changed content. A rejected request never changes the
+incident.
+
+### GET /incidents/{id}
+
+Return one incident:
+
+```json
+{
+  "id": "INC-1",
+  "title": "Checkout outage",
+  "service": "checkout",
+  "status": "resolved",
+  "version": 4,
+  "events": [ { "id": "evt-1", "...": "full stored event content" } ],
+  "history": [
+    {"operator":"alice","action":"create","content":"Checkout outage","version":1,"at":"2026-10-02T08:00:00.123456789Z"},
+    {"action_id":"n1","operator":"bob","action":"add_note","content":"investigating","version":2,"at":"..."},
+    {"action_id":"l1","operator":"bob","action":"link_event","content":"evt-1","version":3,"at":"..."},
+    {"action_id":"r1","operator":"bob","action":"resolve","content":"rolled back","version":4,"at":"..."}
+  ]
+}
+```
+
+`events` lists every linked event with its full stored content in link order;
+an empty list is `[]`. `history` covers the creation and every successful
+action in commit order. The creation entry records the operator, action
+`create`, the title as its `content`, version `1`, and the server time, and
+has no `action_id`; later entries also carry their `action_id`. Every `at` is
+UTC RFC3339Nano. The whole response is one committed snapshot, so its status
+and history always belong to the same version. An unknown id is `404`.
+
+Incidents are stored in their own append-only `incidents.log` in the same
+data directory, under the same durability and recovery rules as
+`events.log`: confirmed creates and actions survive a normal restart or a
+kill, only an incomplete trailing record is discarded, and any other
+corruption prevents startup without touching the existing data. A failed
+incident write returns `503` and every later incident request in that process
+returns `503` until restart; event endpoints are unaffected, and vice versa.
+Old data directories without `incidents.log` work unchanged, and
+`POST /alerts/preview` never creates incidents.
+
 All error responses are JSON objects with a non-empty `error` string, e.g.
 `{"error":"event id already exists with different content"}`.
 

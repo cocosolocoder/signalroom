@@ -183,6 +183,19 @@ func (t *Timeline) SnapshotIDs(query Query) []string {
 	return ids
 }
 
+// LookupEvent returns the service of a stored event, or ok=false when the id
+// is unknown. It never mutates the timeline, which lets incident handling
+// link events without changing them.
+func (t *Timeline) LookupEvent(id string) (service string, ok bool) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	event, found := t.byID[id]
+	if !found {
+		return "", false
+	}
+	return event.Service, true
+}
+
 // EventsByID returns the events for ids in the requested order. Every id
 // must refer to a stored event; events are never removed, so a set captured
 // by SnapshotIDs stays resolvable. Missing ids are skipped only when the
