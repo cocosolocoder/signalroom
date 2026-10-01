@@ -41,6 +41,17 @@ func (f *fakeStorage) Poisoned() bool {
 	return f.poisoned
 }
 
+// testCursorSecret backs the in-memory cursor signer used by handler tests.
+var testCursorSecret = []byte("test-secret-test-secret-test-secret")
+
+func (f *fakeStorage) SignCursor(payload []byte) (string, error) {
+	return signTestCursor(payload), nil
+}
+
+func (f *fakeStorage) VerifyCursor(token string) ([]byte, error) {
+	return verifyTestCursor(token)
+}
+
 func newTestServer(t *testing.T) (*httptest.Server, *fakeStorage, *events.Timeline) {
 	t.Helper()
 	tl := events.NewTimeline()

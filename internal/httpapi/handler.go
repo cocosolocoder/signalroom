@@ -15,10 +15,12 @@ import (
 // maxBodyBytes bounds a single POST /events request.
 const maxBodyBytes = 16 << 20
 
-// Storage durably persists a batch before it becomes visible.
+// Storage durably persists a batch before it becomes visible and signs the
+// opaque pagination cursors whose secret belongs to the same data directory.
 type Storage interface {
 	Append(batch []events.Event) error
 	Poisoned() bool
+	CursorSigner
 }
 
 type envelope struct {
@@ -36,6 +38,7 @@ type Handler struct {
 func NewHandler(timeline *events.Timeline, log Storage) *Handler {
 	h := &Handler{timeline: timeline, log: log, mux: http.NewServeMux()}
 	h.mux.HandleFunc("/events", h.events)
+	h.mux.HandleFunc("/events/page", h.pageEvents)
 	h.mux.HandleFunc("/events/compare", h.compareEvents)
 	h.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not found")
@@ -127,35 +130,9 @@ func (h *Handler) getEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	values := r.URL.Query()
-	labels, err := events.ParseLabelConditions(values["label"])
+	query, err := parseEventFilter(r.URL.Query())
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	query := events.Query{
-		Service:  values.Get("service"),
-		Severity: values.Get("severity"),
-		Labels:   labels,
-	}
-	if raw := values.Get("since"); raw != "" {
-		parsed, err := time.Parse(time.RFC3339Nano, raw)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, "since must be an RFC3339Nano timestamp")
-			return
-		}
-		query.Since = parsed
-	}
-	if raw := values.Get("until"); raw != "" {
-		parsed, err := time.Parse(time.RFC3339Nano, raw)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, "until must be an RFC3339Nano timestamp")
-			return
-		}
-		query.Until = parsed
-	}
-	if !query.Since.IsZero() && !query.Until.IsZero() && query.Since.After(query.Until) {
-		writeError(w, http.StatusBadRequest, "since must not be after until")
 		return
 	}
 

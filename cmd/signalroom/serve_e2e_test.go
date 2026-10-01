@@ -231,6 +231,56 @@ func waitTCPPortClosed(t *testing.T, addr string) {
 	t.Fatalf("port %s still accepting connections", addr)
 }
 
+// pageResult is one decoded GET /events/page response.
+type pageResult struct {
+	Events     []map[string]any `json:"events"`
+	NextCursor *string          `json:"next_cursor"`
+}
+
+func getPage(t *testing.T, p *serverProc, query string) (int, pageResult) {
+	t.Helper()
+	status, raw := httpDo(t, http.MethodGet, "http://"+p.addr+"/events/page"+query, "")
+	var out pageResult
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("decode page %q: %v", raw, err)
+	}
+	return status, out
+}
+
+func pageEventIDs(page pageResult) string {
+	parts := make([]string, len(page.Events))
+	for i, event := range page.Events {
+		parts[i] = event["id"].(string)
+	}
+	return strings.Join(parts, ",")
+}
+
+func walkAllPages(t *testing.T, p *serverProc, firstQuery string) string {
+	t.Helper()
+	var got []string
+	query := firstQuery
+	cursor := ""
+	for {
+		var q string
+		if cursor == "" {
+			q = query
+		} else {
+			q = "?cursor=" + cursor
+		}
+		status, page := getPage(t, p, q)
+		if status != http.StatusOK {
+			t.Fatalf("page status %d", status)
+		}
+		for _, event := range page.Events {
+			got = append(got, event["id"].(string))
+		}
+		if page.NextCursor == nil {
+			return strings.Join(got, ",")
+		}
+		cursor = *page.NextCursor
+	}
+}
+
 const sampleEvents = `{"events":[
 	{"id":"e1","service":"gateway","severity":"critical","message":"spike","at":"2026-10-01T09:00:00Z"},
 	{"id":"e2","service":"api","severity":"info","message":"ok","at":"2026-10-01T10:00:00Z"}
@@ -515,6 +565,187 @@ func TestServeHTTPErrorsAreJSON(t *testing.T) {
 	}
 	if err := json.Unmarshal(raw, &errBody); err != nil || errBody["error"] == "" {
 		t.Fatalf("error body: %s", raw)
+	}
+	p.signal(t, syscall.SIGTERM)
+	p.waitExit(t, 0)
+}
+
+// postSimpleEvent submits one minimal info event with the given id and time.
+func postSimpleEvent(t *testing.T, p *serverProc, id, at string) {
+	t.Helper()
+	body := fmt.Sprintf(`{"events":[{"id":%q,"service":"svc","severity":"info","message":"m","at":%q}]}`, id, at)
+	postEvents(t, p, body)
+}
+
+func TestServePageWalksAndPreservesLabels(t *testing.T) {
+	p := startServer(t, t.TempDir())
+	labeled := `{"events":[
+		{"id":"e1","service":"gateway","severity":"critical","message":"spike","at":"2026-10-01T09:00:00Z","labels":{"env":"prod","version":"v2"}},
+		{"id":"e2","service":"api","severity":"info","message":"ok","at":"2026-10-01T10:00:00Z"},
+		{"id":"e3","service":"gateway","severity":"info","message":"ok","at":"2026-10-01T11:00:00Z","labels":{"env":"prod"}}
+	]}`
+	postEvents(t, p, labeled)
+
+	status, first := getPage(t, p, "?limit=2")
+	if status != http.StatusOK || pageEventIDs(first) != "e1,e2" || first.NextCursor == nil {
+		t.Fatalf("first page: %d %+v", status, first)
+	}
+	labels, ok := first.Events[0]["labels"].(map[string]any)
+	if !ok || labels["env"] != "prod" || labels["version"] != "v2" {
+		t.Fatalf("full labels missing: %+v", first.Events[0])
+	}
+	if _, present := first.Events[1]["labels"]; present {
+		t.Fatalf("label-less event must omit labels: %+v", first.Events[1])
+	}
+
+	status, last := getPage(t, p, "?cursor="+*first.NextCursor+"&limit=2")
+	if status != http.StatusOK || pageEventIDs(last) != "e3" || last.NextCursor != nil {
+		t.Fatalf("last page: %d %+v", status, last)
+	}
+}
+
+func TestServePageCursorSurvivesKillWithoutLaterWrites(t *testing.T) {
+	dataDir := t.TempDir()
+	p := startServer(t, dataDir)
+	for i := range 5 {
+		postSimpleEvent(t, p, fmt.Sprintf("e%d", i), fmt.Sprintf("2026-10-01T09:0%d:00Z", i))
+	}
+
+	// Freeze the whole set and read only the first page before the crash.
+	status, first := getPage(t, p, "?limit=2")
+	if status != http.StatusOK || pageEventIDs(first) != "e0,e1" {
+		t.Fatalf("first page: %d %+v", status, first)
+	}
+	cursor := *first.NextCursor
+
+	// Hard kill with no further writes: the cursor must remain valid.
+	p.signal(t, syscall.SIGKILL)
+	p.waitExit(t, -1)
+	waitTCPPortClosed(t, p.addr)
+
+	p2 := startServer(t, dataDir)
+	status, second := getPage(t, p2, "?cursor="+cursor+"&limit=2")
+	if status != http.StatusOK || pageEventIDs(second) != "e2,e3" {
+		t.Fatalf("resume after SIGKILL: %d %+v", status, second)
+	}
+
+	// Write something brand new, then kill again; the frozen walk must still
+	// finish on e4 and never admit the new event.
+	postSimpleEvent(t, p2, "later", "2026-10-01T08:00:00Z") // earlier time
+	p2.signal(t, syscall.SIGKILL)
+	p2.waitExit(t, -1)
+	waitTCPPortClosed(t, p2.addr)
+
+	p3 := startServer(t, dataDir)
+	status, third := getPage(t, p3, "?cursor="+*second.NextCursor+"&limit=10")
+	if status != http.StatusOK || pageEventIDs(third) != "e4" || third.NextCursor != nil {
+		t.Fatalf("frozen walk after restart must ignore new writes: %d %+v", status, third)
+	}
+	// A new first page sees the current data, including historical events.
+	if got := walkAllPages(t, p3, "?limit=2"); got != "later,e0,e1,e2,e3,e4" {
+		t.Fatalf("fresh walk sees current set: %s", got)
+	}
+	p3.signal(t, syscall.SIGTERM)
+	p3.waitExit(t, 0)
+}
+
+func TestServePageHistoricalDataUsableAfterUpgrade(t *testing.T) {
+	// An existing data directory containing only an events.log (no cursor
+	// key, as it would look before this feature existed) must work for
+	// paging immediately, with historical events in the first page.
+	dataDir := t.TempDir()
+	payload := []byte(`[{"id":"old","service":"svc","severity":"info","message":"m","at":"2026-10-01T09:00:00Z"}]`)
+	frame := make([]byte, 8+len(payload))
+	binary.BigEndian.PutUint32(frame[0:4], uint32(len(payload)))
+	binary.BigEndian.PutUint32(frame[4:8], crc32.ChecksumIEEE(payload))
+	copy(frame[8:], payload)
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "events.log"), frame, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	p := startServer(t, dataDir)
+	status, page := getPage(t, p, "?limit=10")
+	if status != http.StatusOK || pageEventIDs(page) != "old" || page.NextCursor != nil {
+		t.Fatalf("historical event must page without re-ingestion: %d %+v", status, page)
+	}
+	if _, err := os.Stat(filepath.Join(dataDir, "cursor.key")); err != nil {
+		t.Fatalf("cursor key must be created on first upgraded start: %v", err)
+	}
+	p.signal(t, syscall.SIGTERM)
+	p.waitExit(t, 0)
+}
+
+func TestServePageCursorRejectedFromOtherDirectory(t *testing.T) {
+	dirA := t.TempDir()
+	dirB := t.TempDir()
+	a := startServer(t, dirA)
+	postSimpleEvent(t, a, "e0", "2026-10-01T09:00:00Z")
+	postSimpleEvent(t, a, "e1", "2026-10-01T09:01:00Z")
+	_, first := getPage(t, a, "?limit=1")
+	cursor := *first.NextCursor
+
+	b := startServer(t, dirB)
+	postSimpleEvent(t, b, "e0", "2026-10-01T09:00:00Z")
+	status, raw := httpDo(t, http.MethodGet, "http://"+b.addr+"/events/page?cursor="+cursor+"&limit=1", "")
+	if status != http.StatusBadRequest {
+		t.Fatalf("foreign cursor must be 400, got %d: %s", status, raw)
+	}
+	var errBody map[string]string
+	if err := json.Unmarshal(raw, &errBody); err != nil || errBody["error"] == "" {
+		t.Fatalf("foreign cursor error body: %s", raw)
+	}
+	a.signal(t, syscall.SIGTERM)
+	a.waitExit(t, 0)
+	b.signal(t, syscall.SIGTERM)
+	b.waitExit(t, 0)
+}
+
+func TestServePageBadLimitAndCursorAre400(t *testing.T) {
+	p := startServer(t, t.TempDir())
+	postSimpleEvent(t, p, "e0", "2026-10-01T09:00:00Z")
+	for _, query := range []string{
+		"?limit=0",
+		"?limit=1001",
+		"?limit=x",
+		"?limit=1&limit=2",
+		"?cursor=",
+		"?cursor=garbage",
+		"?cursor=a.b.c",
+	} {
+		status, raw := httpDo(t, http.MethodGet, "http://"+p.addr+"/events/page"+query, "")
+		if status != http.StatusBadRequest {
+			t.Fatalf("%s want 400, got %d: %s", query, status, raw)
+		}
+		var errBody map[string]string
+		if err := json.Unmarshal(raw, &errBody); err != nil || errBody["error"] == "" {
+			t.Fatalf("%s error body: %s", query, raw)
+		}
+	}
+	p.signal(t, syscall.SIGTERM)
+	p.waitExit(t, 0)
+}
+
+func TestServePageFilterMismatchIs400(t *testing.T) {
+	p := startServer(t, t.TempDir())
+	postSimpleEvent(t, p, "e0", "2026-10-01T09:00:00Z")
+	postSimpleEvent(t, p, "e1", "2026-10-01T09:01:00Z")
+
+	status, first := getPage(t, p, "?service=svc&limit=1")
+	if status != http.StatusOK || pageEventIDs(first) != "e0" {
+		t.Fatalf("first page: %d %+v", status, first)
+	}
+	// Equivalent restatement is accepted (whitespace tolerated by rules).
+	status, okPage := getPage(t, p, "?cursor="+*first.NextCursor+"&service=%20svc%20&limit=1")
+	if status != http.StatusOK || pageEventIDs(okPage) != "e1" {
+		t.Fatalf("equivalent filters must continue: %d %+v", status, okPage)
+	}
+	// A different filter is rejected.
+	status, raw := httpDo(t, http.MethodGet, "http://"+p.addr+"/events/page?cursor="+*first.NextCursor+"&service=other&limit=1", "")
+	if status != http.StatusBadRequest {
+		t.Fatalf("mismatched filters must be 400, got %d: %s", status, raw)
 	}
 	p.signal(t, syscall.SIGTERM)
 	p.waitExit(t, 0)

@@ -29,6 +29,12 @@ event survives a restart or a process crash. Only an incomplete final write
 (torn tail after a crash) is discarded; any other corruption makes startup
 fail with a non-zero status without modifying the data.
 
+Besides the event log, the data directory holds `cursor.key`, a random
+per-directory secret created on first start that signs `GET /events/page`
+cursors. It is never transmitted and is what makes a cursor from one data
+directory invalid in another; deleting it invalidates outstanding cursors
+but leaves the events untouched.
+
 ### POST /events
 
 Submit a batch. The body must be a JSON object containing exactly an `events`
@@ -90,6 +96,58 @@ events without labels omit the field. Optional query parameters:
 
 ```bash
 curl -sS 'localhost:8080/events?service=gateway&severity=critical&label=env=prod&label=version=v2&since=2026-10-01T00:00:00Z&until=2026-10-02T00:00:00Z'
+```
+
+### GET /events/page
+
+Page through a stable, cursor-based view of the events without building the
+whole array. The first page accepts the same `service`, `severity`,
+`since`/`until`, and repeatable `label` filters as `GET /events`, with the
+same trimming, casing, inclusive-end, and label rules. `limit` bounds one
+page: it is a single decimal integer from `1` to `1000` and defaults to
+`100` when omitted; a missing, duplicated, empty, non-decimal, or out-of-range
+`limit` is a `400`.
+
+`200` returns `{"events":[...], "next_cursor": ...}`. The events are ordered
+by time then id and carry their full `labels` object (the field is omitted
+for label-less events); an empty match is `"events":[]`. `next_cursor` is an
+opaque string while more records remain and `null` on the final page.
+
+The first page fixes the set of events that were fully committed at that
+instant and matched the filters; every later page reads from that same
+frozen set. Events ingested while a walk is in progress — even events with an
+earlier timestamp, events inside the filter window, or events sharing a
+timestamp with a matched one — never appear in that walk, and an identical
+re-ingestion does not change it either; start a new first-page request to see
+them. A batch committed concurrently with the first page is either wholly in
+the frozen set or wholly out of it. Walking to a `null` cursor yields every
+matching record exactly once.
+
+Continue with `cursor=<next_cursor>`; the cursor may be reused any number of
+times by any number of clients, and repeating the same cursor and limit
+returns the same page and the same next cursor — paging never consumes
+progress. `limit` may change between pages; reading resumes from the same
+position.
+
+A continuation normally carries no filter parameters and reuses the first
+page's filters. If *any* filter is present, the complete normalized filter
+set must be restated and match the first page's; reordering label
+conditions, trimming-allowed whitespace, changing severity letter case, or
+expressing the same instant in another time zone all count as identical.
+Any mismatch — including a partial restatement or a changed single condition
+— is a `400`.
+
+Cursors are bound to the data directory with a server-held secret. They keep
+working across a normal restart or a killed process, never expose writes that
+arrived after the set was frozen, and are rejected (`400`) by any other data
+directory. Empty, duplicated, unparseable, out-of-range, or tampered cursors
+all return `400` with a non-empty `error`; a request never silently starts a
+new query. As with the other endpoints, poisoned storage returns `503`.
+
+```bash
+curl -sS 'localhost:8080/events/page?service=gateway&limit=100'
+# {"events":[...],"next_cursor":"eyJ2IjoxLi4ufQ.<signature>"}
+curl -sS 'localhost:8080/events/page?cursor=eyJ2IjoxLi4ufQ.<signature>&limit=100'
 ```
 
 ### GET /events/compare

@@ -37,10 +37,11 @@ var ErrPoisoned = errors.New("event log is unavailable after a storage failure")
 // Log is an append-only, concurrency-safe frame writer holding an exclusive
 // directory lock for its lifetime.
 type Log struct {
-	mu       sync.Mutex
-	file     *os.File
-	lockFile *os.File
-	poisoned bool
+	mu        sync.Mutex
+	file      *os.File
+	lockFile  *os.File
+	poisoned  bool
+	cursorKey []byte
 }
 
 // CorruptionError marks a complete frame that fails its checksum or contains
@@ -120,7 +121,15 @@ func Open(dir string) (*Log, [][]events.Event, error) {
 		return nil, nil, fmt.Errorf("sync data directory: %w", err)
 	}
 
-	return &Log{file: file, lockFile: lockFile}, batches, nil
+	cursorKey, err := ensureCursorKey(dir)
+	if err != nil {
+		file.Close()
+		unlock(lockFile)
+		lockFile.Close()
+		return nil, nil, err
+	}
+
+	return &Log{file: file, lockFile: lockFile, cursorKey: cursorKey}, batches, nil
 }
 
 // replay scans the log and returns the valid batches, the byte offset at
