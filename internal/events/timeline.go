@@ -1,6 +1,7 @@
 package events
 
 import (
+	"maps"
 	"sort"
 	"strings"
 	"sync"
@@ -141,16 +142,23 @@ func (t *Timeline) Query(query Query) []Event {
 		if !query.Until.IsZero() && event.At.After(query.Until) {
 			continue
 		}
+		if !labelsMatch(event.Labels, query.Labels) {
+			continue
+		}
 		result = append(result, event)
 	}
 	return result
 }
 
-// sameEvent compares two normalized events on their absolute instant.
+// sameEvent compares two normalized events on their absolute instant and
+// their labels. Normalized label sets are nil when empty, so the three "no
+// labels" spellings compare equal, and map comparison makes key order and
+// original whitespace irrelevant.
 func sameEvent(a, b Event) bool {
 	return a.ID == b.ID &&
 		a.Service == b.Service &&
 		a.Severity == b.Severity &&
 		a.Message == b.Message &&
-		a.At.Equal(b.At)
+		a.At.Equal(b.At) &&
+		maps.Equal(a.Labels, b.Labels)
 }

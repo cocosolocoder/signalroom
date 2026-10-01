@@ -13,11 +13,12 @@ const maxCompareSegments = 10000
 
 // CompareQuery selects two equal-length, half-open windows [Since, Until) and
 // [BaselineSince, BaselineUntil) and divides them into intervals of Step,
-// keeping only events that pass the same optional service and severity
-// filters Query uses.
+// keeping only events that pass the same optional service, severity, and
+// label filters Query uses.
 type CompareQuery struct {
 	Service       string
 	Severity      string
+	Labels        map[string]string
 	BaselineSince time.Time
 	BaselineUntil time.Time
 	Since         time.Time
@@ -89,6 +90,9 @@ func (t *Timeline) Compare(query CompareQuery) (CompareResult, error) {
 			continue
 		}
 		if severity != "" && event.Severity != severity {
+			continue
+		}
+		if !labelsMatch(event.Labels, query.Labels) {
 			continue
 		}
 		if i, ok := bucketIndex(event.At, query.BaselineSince, query.BaselineUntil, query.Step); ok {

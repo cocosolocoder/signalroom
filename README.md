@@ -33,9 +33,21 @@ fail with a non-zero status without modifying the data.
 
 Submit a batch. The body must be a JSON object containing exactly an `events`
 array. Each event uses the fields `id`, `service`, `severity`, `message` and
-`at`; `at` is an RFC3339Nano timestamp. Unknown fields are rejected. String
-fields are trimmed and `severity` is lowercased; `id`, `service`, `message`
-and `at` are required.
+`at`, plus an optional `labels` object; `at` is an RFC3339Nano timestamp.
+Unknown fields are rejected. String fields are trimmed and `severity` is
+lowercased; `id`, `service`, `message` and `at` are required.
+
+`labels` is a JSON object of string to string (for example
+`{"env":"prod","region":"cn-north-1","version":"v2"}`). Omitting it, `null`,
+and `{}` all mean "no labels". Names and values are trimmed of surrounding
+whitespace, keep their case, and must be non-empty afterwards; an event may
+carry at most 32 labels, with names up to 64 and values up to 256 Unicode
+code points. Non-string values, duplicate JSON keys, names that collide after
+trimming, and anything past these limits are rejected with `400`.
+
+Labels are part of the event's content: a retry with the same id must carry
+the same labels (order and surrounding whitespace are irrelevant), otherwise
+it is a `409` conflict.
 
 The whole batch is accepted or rejected together, with input validation
 taking precedence over conflict checks:
@@ -54,7 +66,7 @@ timezone offsets is treated as identical.
 ```bash
 curl -sS -X POST localhost:8080/events \
   -H 'Content-Type: application/json' \
-  -d '{"events":[{"id":"evt-1","service":"gateway","severity":"CRITICAL","message":"error rate spike","at":"2026-10-01T10:00:00.123456789+08:00"}]}'
+  -d '{"events":[{"id":"evt-1","service":"gateway","severity":"CRITICAL","message":"error rate spike","at":"2026-10-01T10:00:00.123456789+08:00","labels":{"env":"prod","version":"v2"}}]}'
 ```
 
 Re-sending the identical body returns `{"created":0,"replayed":1}`.
@@ -62,15 +74,22 @@ Re-sending the identical body returns `{"created":0,"replayed":1}`.
 ### GET /events
 
 Return the stored events as a JSON array ordered by time then id; an empty
-result is `[]`. Optional query parameters:
+result is `[]`. Events with labels include the full stored `labels` object;
+events without labels omit the field. Optional query parameters:
 
 - `service` — exact match after trimming.
 - `severity` — case-insensitive match after trimming.
 - `since`, `until` — RFC3339Nano instants, both ends inclusive. A missing end
   is unbounded. An inverted range or an unparsable timestamp yields `400`.
+- `label` — repeatable, up to 32 conditions, each `label=name=value`. The
+  first `=` splits name from value (later equals signs belong to the value);
+  both follow the ingestion trimming and limit rules. Every condition must
+  match, events missing the label never match, and comparison is
+  case-sensitive. Empty conditions, a missing `=`, invalid names or values,
+  and conditions that collide after trimming all yield `400`.
 
 ```bash
-curl -sS 'localhost:8080/events?service=gateway&severity=critical&since=2026-10-01T00:00:00Z&until=2026-10-02T00:00:00Z'
+curl -sS 'localhost:8080/events?service=gateway&severity=critical&label=env=prod&label=version=v2&since=2026-10-01T00:00:00Z&until=2026-10-02T00:00:00Z'
 ```
 
 ### GET /events/compare
@@ -87,6 +106,9 @@ integer from `1` to `86400` seconds:
 - `step` — segment size in seconds.
 - `service`, `severity` — optional, using the same trimming and
   case-insensitive rules as `GET /events`; only matching events are counted.
+- `label` — optional and repeatable (up to 32), same `name=value` rules as
+  `GET /events`; totals and every segment count only events matching all
+  conditions.
 
 Segments start at each window's beginning and advance every `step` seconds;
 the final segment ends at the window end even when it is shorter than a full

@@ -128,9 +128,15 @@ func (h *Handler) getEvents(w http.ResponseWriter, r *http.Request) {
 	}
 
 	values := r.URL.Query()
+	labels, err := events.ParseLabelConditions(values["label"])
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	query := events.Query{
 		Service:  values.Get("service"),
 		Severity: values.Get("severity"),
+		Labels:   labels,
 	}
 	if raw := values.Get("since"); raw != "" {
 		parsed, err := time.Parse(time.RFC3339Nano, raw)
@@ -181,11 +187,12 @@ func writeEvents(w http.ResponseWriter, found []events.Event) {
 }
 
 type eventDTO struct {
-	ID       string    `json:"id"`
-	Service  string    `json:"service"`
-	Severity string    `json:"severity"`
-	Message  string    `json:"message"`
-	At       time.Time `json:"at"`
+	ID       string            `json:"id"`
+	Service  string            `json:"service"`
+	Severity string            `json:"severity"`
+	Message  string            `json:"message"`
+	At       time.Time         `json:"at"`
+	Labels   map[string]string `json:"labels,omitempty"`
 }
 
 func eventsToDTOs(found []events.Event) []eventDTO {
@@ -197,6 +204,7 @@ func eventsToDTOs(found []events.Event) []eventDTO {
 			Severity: event.Severity,
 			Message:  event.Message,
 			At:       event.At,
+			Labels:   event.Labels,
 		}
 	}
 	return dtos

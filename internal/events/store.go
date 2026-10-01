@@ -8,21 +8,25 @@ import (
 	"time"
 )
 
-// Event is a normalized operational signal recorded on the incident timeline.
+// Event is a normalized operational signal recorded on the incident
+// timeline. Labels carries optional trimmed metadata (environment, region,
+// release version, ...); it is nil when the event has none.
 type Event struct {
 	ID       string
 	Service  string
 	Severity string
 	Message  string
 	At       time.Time
+	Labels   map[string]string
 }
 
-// Query selects events by optional service and severity filters.
+// Query selects events by optional service, severity, and label filters.
 type Query struct {
 	Service  string
 	Severity string
 	Since    time.Time
 	Until    time.Time
+	Labels   map[string]string
 }
 
 // ValidationError reports that an event failed normalization.
@@ -50,6 +54,7 @@ func IsConflictError(err error) bool {
 // Normalize applies the same field rules every ingestion path uses: trim
 // surrounding whitespace from strings, lowercase severity, and require a
 // non-empty id, service, and message together with a non-zero instant.
+// Labels are trimmed and validated by NormalizeLabels.
 func Normalize(event Event) (Event, error) {
 	event.ID = strings.TrimSpace(event.ID)
 	event.Service = strings.TrimSpace(event.Service)
@@ -58,6 +63,11 @@ func Normalize(event Event) (Event, error) {
 	if event.ID == "" || event.Service == "" || event.Message == "" || event.At.IsZero() {
 		return Event{}, &ValidationError{Reason: "event id, service, message, and timestamp are required"}
 	}
+	labels, err := NormalizeLabels(event.Labels)
+	if err != nil {
+		return Event{}, err
+	}
+	event.Labels = labels
 	return event, nil
 }
 
@@ -116,6 +126,9 @@ func (s *Store) Query(query Query) []Event {
 			continue
 		}
 		if !query.Until.IsZero() && event.At.After(query.Until) {
+			continue
+		}
+		if !labelsMatch(event.Labels, query.Labels) {
 			continue
 		}
 		result = append(result, event)

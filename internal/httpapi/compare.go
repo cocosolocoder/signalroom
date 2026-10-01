@@ -93,9 +93,16 @@ func (h *Handler) compareEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	labels, lerr := events.ParseLabelConditions(values["label"])
+	if lerr != nil {
+		writeError(w, http.StatusBadRequest, lerr.Error())
+		return
+	}
+
 	query := events.CompareQuery{
 		Service:       values.Get("service"),
 		Severity:      values.Get("severity"),
+		Labels:        labels,
 		BaselineSince: baselineStart,
 		BaselineUntil: baselineEnd,
 		Since:         observedStart,

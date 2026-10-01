@@ -297,6 +297,56 @@ func TestServeRecoversUnconfirmedDurableBatch(t *testing.T) {
 	p.waitExit(t, 0)
 }
 
+func TestServeLabelsSurviveKillAndDedupeRetry(t *testing.T) {
+	dataDir := t.TempDir()
+	p := startServer(t, dataDir)
+	labeled := `{"events":[
+		{"id":"e1","service":"gateway","severity":"critical","message":"spike","at":"2026-10-01T09:00:00Z","labels":{"env":"prod","version":"v2"}},
+		{"id":"e2","service":"api","severity":"info","message":"ok","at":"2026-10-01T10:00:00Z"}
+	]}`
+	if counts := postEvents(t, p, labeled); counts["created"] != 2 {
+		t.Fatalf("created=%v", counts)
+	}
+
+	p.signal(t, syscall.SIGKILL)
+	p.waitExit(t, -1)
+	waitTCPPortClosed(t, p.addr)
+
+	p2 := startServer(t, dataDir)
+	got := getEvents(t, p2, "")
+	if len(got) != 2 {
+		t.Fatalf("recovery after SIGKILL: %+v", got)
+	}
+	labels, ok := got[0]["labels"].(map[string]any)
+	if !ok || labels["env"] != "prod" || labels["version"] != "v2" {
+		t.Fatalf("labels must survive restart: %+v", got[0])
+	}
+	if _, present := got[1]["labels"]; present {
+		t.Fatalf("label-less event must stay label-less: %+v", got[1])
+	}
+
+	// A retry with reordered, whitespace-padded labels replays after restart.
+	retry := postEvents(t, p2, `{"events":[{"id":"e1","service":"gateway","severity":"critical","message":"spike","at":"2026-10-01T09:00:00Z","labels":{" version ":"v2","env":" prod "}}]}`)
+	if retry["created"] != 0 || retry["replayed"] != 1 {
+		t.Fatalf("label retry after restart: %+v", retry)
+	}
+	// A changed label still conflicts after restart.
+	status, raw := httpDo(t, http.MethodPost, "http://"+p2.addr+"/events",
+		`{"events":[{"id":"e1","service":"gateway","severity":"critical","message":"spike","at":"2026-10-01T09:00:00Z","labels":{"env":"prod","version":"v3"}}]}`)
+	if status != http.StatusConflict {
+		t.Fatalf("changed labels must conflict after restart: %d %s", status, raw)
+	}
+
+	// Label filters work on recovered data.
+	filtered := getEvents(t, p2, "?label=env=prod")
+	if len(filtered) != 1 || filtered[0]["id"] != "e1" {
+		t.Fatalf("label filter after restart: %+v", filtered)
+	}
+
+	p2.signal(t, syscall.SIGTERM)
+	p2.waitExit(t, 0)
+}
+
 func TestServeSecondInstanceRejected(t *testing.T) {
 	dataDir := t.TempDir()
 	first := startServer(t, dataDir)
