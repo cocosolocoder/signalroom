@@ -173,6 +173,96 @@ inverted or unequal-length windows, and the 10000-segment limit all return
 `400` with a non-empty `error`. As with the other endpoints, a poisoned store
 returns `503`.
 
+### POST /alerts/preview
+
+Preview when each service (and optionally label combination) would trigger
+and recover alerts under a count rule, without sending notifications or
+creating incidents. The body is a JSON object:
+
+```json
+{
+  "since": "2026-10-01T10:00:00Z",
+  "until": "2026-10-01T11:00:00Z",
+  "window_seconds": 60,
+  "threshold": 10,
+  "trigger_windows": 2,
+  "recover_windows": 2,
+  "service": "gateway",
+  "severity": "critical",
+  "labels": {"env": "prod"},
+  "group_by": ["env", "region"]
+}
+```
+
+- `since`, `until` — required RFC3339Nano instants; the start must be
+  strictly before the end. Windows are half-open (the start is included, the
+  end excluded), counted from `since`; a final window shorter than
+  `window_seconds` still participates.
+- `window_seconds` — required integer from `1` to `86400`.
+- `threshold` — required integer from `1` to `1000000`; a window reaches the
+  rule when its count is at least the threshold.
+- `trigger_windows`, `recover_windows` — required integers from `1` to `100`,
+  the consecutive windows needed to open and to recover an alert.
+- `service`, `severity` — optional, using the same trimming and
+  case-insensitive rules as `GET /events`.
+- `labels` — optional object of string to string, same name/value rules as
+  ingestion; only matching events are counted.
+- `group_by` — optional array of up to four label names. Names follow the
+  ingestion label-name rules (trimmed, non-empty, at most 64 Unicode code
+  points, no collisions after trimming). Events missing a named label form
+  their own group with the value `null`.
+
+Only combinations with at least one matching event inside the range produce a
+group; every group still gets the complete window list with zero counts
+filled in. A group starts normal with no history from before the range:
+consecutive windows at or above the threshold reaching `trigger_windows` open
+an alert at the end of the trigger window (a window below the threshold
+restarts the streak); while alerting, consecutive windows below the threshold
+reaching `recover_windows` recover at that window's end (a window at or above
+the threshold restarts the recovery streak). A group still alerting at the
+range end keeps `recovered_at` set to `null`; alerts never close
+automatically, and a recovered group can trigger again.
+
+The response is `200`:
+
+```json
+{
+  "groups": [
+    {
+      "service": "gateway",
+      "labels": {"env": "prod", "region": null},
+      "windows": [
+        {"since": "2026-10-01T10:00:00Z", "until": "2026-10-01T10:01:00Z", "count": 3, "state": "normal"},
+        {"since": "2026-10-01T10:01:00Z", "until": "2026-10-01T10:02:00Z", "count": 12, "state": "alerting"}
+      ]
+    }
+  ],
+  "alerts": [
+    {"service": "gateway", "labels": {"env": "prod", "region": null}, "triggered_at": "2026-10-01T10:02:00Z", "recovered_at": null}
+  ]
+}
+```
+
+Groups are ordered by service name, then by the `group_by` values in request
+order, with a missing value sorting before any string. `windows` carries each
+window's boundaries, count, and end-of-window state (`normal` or `alerting`),
+ordered from the range start. `alerts` lists every alert across all groups in
+trigger-time order; equal trigger instants keep the group order. Timestamps
+always use UTC RFC3339Nano with nanosecond precision.
+
+Unknown or duplicate JSON fields, missing or mistyped fields, out-of-range
+values, illegal filters, a range needing more than 10000 windows, and a
+group/window cell count over 100000 all return `400` with a non-empty `error`
+and no partial result. The whole preview is computed from one committed
+snapshot, so a batch written during the request is either fully included or
+fully absent, and a poisoned store returns `503`.
+
+```bash
+curl -sS -X POST localhost:8080/alerts/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"since":"2026-10-01T10:00:00Z","until":"2026-10-01T11:00:00Z","window_seconds":60,"threshold":10,"trigger_windows":2,"recover_windows":2}'
+```
+
 All error responses are JSON objects with a non-empty `error` string, e.g.
 `{"error":"event id already exists with different content"}`.
 

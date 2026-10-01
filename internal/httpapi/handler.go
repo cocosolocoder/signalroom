@@ -41,6 +41,7 @@ func NewHandler(timeline *events.Timeline, log Storage, cursors CursorStore) *Ha
 	h.mux.HandleFunc("/events", h.events)
 	h.mux.HandleFunc("/events/compare", h.compareEvents)
 	h.mux.HandleFunc("/events/page", h.pageEvents)
+	h.mux.HandleFunc("/alerts/preview", h.previewAlerts)
 	h.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not found")
 	})
