@@ -208,6 +208,119 @@ func TestServeIncidentTornTailTrimmed(t *testing.T) {
 	second.waitExit(t, 0)
 }
 
+func TestServeParticipantsPersistAcrossKill(t *testing.T) {
+	dataDir := t.TempDir()
+	p := startServer(t, dataDir)
+
+	status, created := postIncident(t, p, `{"id":"INC-1","title":" Outage ","service":"gateway","operator":"alice"}`)
+	if status != http.StatusOK || incNumber(created["version"]) != 1 {
+		t.Fatalf("create %d %v", status, created)
+	}
+
+	// Add participants and assign owner.
+	if s, a := postIncidentAction(t, p, "INC-1", `{"action_id":"a1","operator":"bob","expected_version":1,"action":"add_participant","participant":"zoe"}`); s != http.StatusOK || incNumber(a["version"]) != 2 {
+		t.Fatalf("add_participant %d %v", s, a)
+	}
+	if s, a := postIncidentAction(t, p, "INC-1", `{"action_id":"a2","operator":"bob","expected_version":2,"action":"add_participant","participant":"bob"}`); s != http.StatusOK || incNumber(a["version"]) != 3 {
+		t.Fatalf("add_participant bob %d %v", s, a)
+	}
+	if s, a := postIncidentAction(t, p, "INC-1", `{"action_id":"o1","operator":"bob","expected_version":3,"action":"assign_owner","participant":"zoe"}`); s != http.StatusOK || incNumber(a["version"]) != 4 {
+		t.Fatalf("assign_owner %d %v", s, a)
+	}
+
+	// Hard kill; fsync had already confirmed every record.
+	p.signal(t, syscall.SIGKILL)
+	p.waitExit(t, -1)
+	waitTCPPortClosed(t, p.addr)
+
+	p2 := startServer(t, dataDir)
+
+	// Personnel recovered.
+	status, got := getIncident(t, p2, "INC-1")
+	if status != http.StatusOK {
+		t.Fatalf("get after restart %d", status)
+	}
+	participants, _ := got["participants"].([]any)
+	if len(participants) != 3 {
+		t.Fatalf("participants %v", got["participants"])
+	}
+	want := []string{"alice", "bob", "zoe"}
+	for i, w := range want {
+		if participants[i] != w {
+			t.Fatalf("participants[%d]=%v want %s", i, participants[i], w)
+		}
+	}
+	if got["owner"] != "zoe" {
+		t.Fatalf("owner %v", got["owner"])
+	}
+	if incNumber(got["version"]) != 4 {
+		t.Fatalf("version %v", got["version"])
+	}
+
+	// Retries after restart return first results and change nothing.
+	if s, a := postIncidentAction(t, p2, "INC-1", `{"action_id":"a1","operator":"bob","expected_version":1,"action":"add_participant","participant":"zoe"}`); s != http.StatusOK || incNumber(a["version"]) != 2 {
+		t.Fatalf("retry add_participant %d %v", s, a)
+	}
+	if s, a := postIncidentAction(t, p2, "INC-1", `{"action_id":"o1","operator":"bob","expected_version":3,"action":"assign_owner","participant":"zoe"}`); s != http.StatusOK || incNumber(a["version"]) != 4 {
+		t.Fatalf("retry assign_owner %d %v", s, a)
+	}
+	if _, still := getIncident(t, p2, "INC-1"); incNumber(still["version"]) != 4 {
+		t.Fatalf("retries must not advance version: %v", still["version"])
+	}
+
+	// Continuing to operate works.
+	if s, a := postIncidentAction(t, p2, "INC-1", `{"action_id":"a3","operator":"bob","expected_version":4,"action":"add_participant","participant":"carol"}`); s != http.StatusOK || incNumber(a["version"]) != 5 {
+		t.Fatalf("add after restart %d %v", s, a)
+	}
+
+	p2.signal(t, syscall.SIGTERM)
+	p2.waitExit(t, 0)
+}
+
+func TestServeLegacyIncidentHasCreatorAsSoleParticipant(t *testing.T) {
+	// An old incidents.log (or one without participant actions) reads with
+	// the creator as the sole participant and owner.
+	dataDir := t.TempDir()
+	p := startServer(t, dataDir)
+
+	status, _ := postIncident(t, p, `{"id":"INC-1","title":"t","service":"gateway","operator":"alice"}`)
+	if status != http.StatusOK {
+		t.Fatalf("create %d", status)
+	}
+	// Add a note (operator bob) and resolve — no participant actions.
+	if s, _ := postIncidentAction(t, p, "INC-1", `{"action_id":"n1","operator":"bob","expected_version":1,"action":"add_note","content":"c"}`); s != http.StatusOK {
+		t.Fatalf("note %d", s)
+	}
+	if s, _ := postIncidentAction(t, p, "INC-1", `{"action_id":"r1","operator":"bob","expected_version":2,"action":"resolve","reason":"fixed"}`); s != http.StatusOK {
+		t.Fatalf("resolve %d", s)
+	}
+
+	p.signal(t, syscall.SIGKILL)
+	p.waitExit(t, -1)
+	waitTCPPortClosed(t, p.addr)
+
+	p2 := startServer(t, dataDir)
+	status, got := getIncident(t, p2, "INC-1")
+	if status != http.StatusOK {
+		t.Fatalf("get %d", status)
+	}
+	participants, _ := got["participants"].([]any)
+	if len(participants) != 1 || participants[0] != "alice" {
+		t.Fatalf("legacy participants %v", got["participants"])
+	}
+	if got["owner"] != "alice" {
+		t.Fatalf("legacy owner %v", got["owner"])
+	}
+
+	// Resolved incident rejects participant actions.
+	if s, _ := postIncidentAction(t, p2, "INC-1", `{"action_id":"a1","operator":"b","expected_version":3,"action":"add_participant","participant":"zoe"}`); s != http.StatusConflict {
+		t.Fatalf("resolved participant action %d", s)
+	}
+
+	p2.signal(t, syscall.SIGTERM)
+	p2.waitExit(t, 0)
+}
+
 func TestServeFailsOnCorruptIncidentLogWithoutMutation(t *testing.T) {
 	dataDir := t.TempDir()
 	first := startServer(t, dataDir)

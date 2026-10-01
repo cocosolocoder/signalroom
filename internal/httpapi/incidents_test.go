@@ -485,3 +485,164 @@ func TestHTTPConcurrentDuplicateActionCommitsOnce(t *testing.T) {
 		t.Fatalf("duplicate concurrent actions must persist once, got %d records", len(store.records))
 	}
 }
+
+func TestHTTPGetIncidentIncludesParticipantsAndOwner(t *testing.T) {
+	server, _, _, _ := newIncidentServer(t)
+	createIncident(t, server)
+
+	status, body := doJSON(t, server, http.MethodGet, "/incidents/INC-1", "")
+	if status != http.StatusOK {
+		t.Fatalf("get status %d", status)
+	}
+	participants, ok := body["participants"].([]any)
+	if !ok || len(participants) != 1 || participants[0] != "alice" {
+		t.Fatalf("participants %v", body["participants"])
+	}
+	if body["owner"] != "alice" {
+		t.Fatalf("owner %v", body["owner"])
+	}
+}
+
+func TestHTTPParticipantActions(t *testing.T) {
+	server, store, _, _ := newIncidentServer(t)
+	createIncident(t, server)
+
+	// Add participant.
+	status, body := postAction(t, server, "INC-1",
+		`{"action_id":"a1","operator":"bob","expected_version":1,"action":"add_participant","participant":" zoe "}`)
+	if status != http.StatusOK || number(body["version"]) != 2 {
+		t.Fatalf("add_participant %d %v", status, body)
+	}
+
+	// Add duplicate -> 409 with current version.
+	status, body = postAction(t, server, "INC-1",
+		`{"action_id":"a2","operator":"bob","expected_version":2,"action":"add_participant","participant":"zoe"}`)
+	if status != http.StatusConflict || number(body["current_version"]) != 2 {
+		t.Fatalf("dup add %d %v", status, body)
+	}
+
+	// Assign owner to zoe.
+	status, body = postAction(t, server, "INC-1",
+		`{"action_id":"o1","operator":"bob","expected_version":2,"action":"assign_owner","participant":"zoe"}`)
+	if status != http.StatusOK || number(body["version"]) != 3 {
+		t.Fatalf("assign_owner %d %v", status, body)
+	}
+
+	// Assign to non-participant -> 409.
+	status, body = postAction(t, server, "INC-1",
+		`{"action_id":"o2","operator":"bob","expected_version":3,"action":"assign_owner","participant":"ghost"}`)
+	if status != http.StatusConflict || number(body["current_version"]) != 3 {
+		t.Fatalf("assign non-participant %d %v", status, body)
+	}
+
+	// Remove current owner -> 409.
+	status, body = postAction(t, server, "INC-1",
+		`{"action_id":"r1","operator":"bob","expected_version":3,"action":"remove_participant","participant":"zoe"}`)
+	if status != http.StatusConflict || number(body["current_version"]) != 3 {
+		t.Fatalf("remove owner %d %v", status, body)
+	}
+
+	// Remove non-existent -> 409.
+	status, body = postAction(t, server, "INC-1",
+		`{"action_id":"r2","operator":"bob","expected_version":3,"action":"remove_participant","participant":"ghost"}`)
+	if status != http.StatusConflict || number(body["current_version"]) != 3 {
+		t.Fatalf("remove missing %d %v", status, body)
+	}
+
+	// Remove alice (not owner) -> ok.
+	status, body = postAction(t, server, "INC-1",
+		`{"action_id":"r3","operator":"bob","expected_version":3,"action":"remove_participant","participant":"alice"}`)
+	if status != http.StatusOK || number(body["version"]) != 4 {
+		t.Fatalf("remove alice %d %v", status, body)
+	}
+
+	// Check GET reflects state.
+	status, got := doJSON(t, server, http.MethodGet, "/incidents/INC-1", "")
+	if status != http.StatusOK {
+		t.Fatalf("get %d", status)
+	}
+	participants, _ := got["participants"].([]any)
+	if len(participants) != 1 || participants[0] != "zoe" {
+		t.Fatalf("participants %v", got["participants"])
+	}
+	if got["owner"] != "zoe" {
+		t.Fatalf("owner %v", got["owner"])
+	}
+
+	// History content is normalized.
+	history, _ := got["history"].([]any)
+	last := history[len(history)-1].(map[string]any)
+	if last["content"] != "alice" || last["action"] != "remove_participant" {
+		t.Fatalf("history entry %v", last)
+	}
+
+	// create + 3 successful participant actions.
+	if len(store.records) != 4 {
+		t.Fatalf("records %d", len(store.records))
+	}
+}
+
+func TestHTTPParticipantActionBadRequest(t *testing.T) {
+	server, _, _, _ := newIncidentServer(t)
+	createIncident(t, server)
+
+	bad := map[string]string{
+		"missing participant":   `{"action_id":"a","operator":"b","expected_version":1,"action":"add_participant"}`,
+		"wrong type":            `{"action_id":"a","operator":"b","expected_version":1,"action":"add_participant","participant":5}`,
+		"empty participant":     `{"action_id":"a","operator":"b","expected_version":1,"action":"add_participant","participant":"  "}`,
+		"unknown field":         `{"action_id":"a","operator":"b","expected_version":1,"action":"add_participant","participant":"zoe","bogus":1}`,
+		"extra payload content": `{"action_id":"a","operator":"b","expected_version":1,"action":"add_participant","participant":"zoe","content":"c"}`,
+		"extra payload event":   `{"action_id":"a","operator":"b","expected_version":1,"action":"add_participant","participant":"zoe","event_id":"e1"}`,
+		"extra payload reason":  `{"action_id":"a","operator":"b","expected_version":1,"action":"add_participant","participant":"zoe","reason":"r"}`,
+		"note with participant": `{"action_id":"a","operator":"b","expected_version":1,"action":"add_note","participant":"zoe"}`,
+	}
+	for name, body := range bad {
+		status, out := postAction(t, server, "INC-1", body)
+		if status != http.StatusBadRequest || out["error"] == "" {
+			t.Fatalf("%s: want 400, got %d %v", name, status, out)
+		}
+	}
+}
+
+func TestHTTPParticipantActionsRejectedOnResolved(t *testing.T) {
+	server, _, _, _ := newIncidentServer(t)
+	createIncident(t, server)
+	_, _ = postAction(t, server, "INC-1",
+		`{"action_id":"r1","operator":"bob","expected_version":1,"action":"resolve","reason":"fixed"}`)
+
+	for _, body := range []string{
+		`{"action_id":"a1","operator":"b","expected_version":2,"action":"add_participant","participant":"zoe"}`,
+		`{"action_id":"a2","operator":"b","expected_version":2,"action":"remove_participant","participant":"alice"}`,
+		`{"action_id":"a3","operator":"b","expected_version":2,"action":"assign_owner","participant":"alice"}`,
+	} {
+		status, out := postAction(t, server, "INC-1", body)
+		if status != http.StatusConflict || out["error"] == "" {
+			t.Fatalf("resolved %s: want 409, got %d %v", body, status, out)
+		}
+	}
+}
+
+func TestHTTPParticipantActionIdempotentReplay(t *testing.T) {
+	server, _, _, _ := newIncidentServer(t)
+	createIncident(t, server)
+	first := `{"action_id":"a1","operator":"bob","expected_version":1,"action":"add_participant","participant":"zoe"}`
+	_, body := postAction(t, server, "INC-1", first)
+	firstVersion := number(body["version"])
+
+	// Advance with another action.
+	_, _ = postAction(t, server, "INC-1",
+		`{"action_id":"a2","operator":"bob","expected_version":2,"action":"add_participant","participant":"bob"}`)
+
+	// Replay returns first result.
+	status, replay := postAction(t, server, "INC-1", first)
+	if status != http.StatusOK || number(replay["version"]) != firstVersion {
+		t.Fatalf("replay %d %v", status, replay)
+	}
+
+	// Same action id with different content -> 409.
+	status, _ = postAction(t, server, "INC-1",
+		`{"action_id":"a1","operator":"bob","expected_version":3,"action":"add_participant","participant":"changed"}`)
+	if status != http.StatusConflict {
+		t.Fatalf("changed replay %d", status)
+	}
+}

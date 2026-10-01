@@ -490,3 +490,216 @@ func TestConcurrentDistinctActionsSerialize(t *testing.T) {
 		t.Fatalf("all %d distinct actions should commit, version=%d", n, inc.Version)
 	}
 }
+
+func TestParticipantsInitializedFromCreation(t *testing.T) {
+	reg, _, _ := newTestRegistry(&fakeEvents{})
+	_, _ = reg.Create(validCreation()) // operator " Alice " -> "Alice"
+
+	inc, _ := reg.Get("INC-1")
+	if len(inc.Participants) != 1 || inc.Participants[0] != "Alice" {
+		t.Fatalf("participants %v", inc.Participants)
+	}
+	if inc.Owner != "Alice" {
+		t.Fatalf("owner %q", inc.Owner)
+	}
+}
+
+func TestAddParticipantSortsAndDedupes(t *testing.T) {
+	reg, _, _ := newTestRegistry(&fakeEvents{})
+	_, _ = reg.Create(validCreation())
+
+	// Add in non-sorted order with surrounding whitespace.
+	_, _ = reg.Apply(Request{IncidentID: "INC-1", ActionID: "a-zoe", Operator: "o", ExpectedVersion: 1, Type: ActionAddParticipant, Content: " zoe "})
+	_, _ = reg.Apply(Request{IncidentID: "INC-1", ActionID: "a-bob", Operator: "o", ExpectedVersion: 2, Type: ActionAddParticipant, Content: "bob"})
+	// "Alice" already present -> conflict.
+	_, err := reg.Apply(Request{IncidentID: "INC-1", ActionID: "a-alice", Operator: "o", ExpectedVersion: 3, Type: ActionAddParticipant, Content: "Alice"})
+	if !IsConflictError(err) {
+		t.Fatalf("dup participant: want conflict, got %v", err)
+	}
+	// "bob" already present -> conflict.
+	_, err = reg.Apply(Request{IncidentID: "INC-1", ActionID: "a-bob2", Operator: "o", ExpectedVersion: 3, Type: ActionAddParticipant, Content: "bob"})
+	if !IsConflictError(err) {
+		t.Fatalf("dup bob: want conflict, got %v", err)
+	}
+
+	inc, _ := reg.Get("INC-1")
+	want := []string{"Alice", "bob", "zoe"}
+	if len(inc.Participants) != len(want) {
+		t.Fatalf("participants %v want %v", inc.Participants, want)
+	}
+	for i := range want {
+		if inc.Participants[i] != want[i] {
+			t.Fatalf("participants %v want %v", inc.Participants, want)
+		}
+	}
+}
+
+func TestParticipantCaseSensitive(t *testing.T) {
+	reg, _, _ := newTestRegistry(&fakeEvents{})
+	_, _ = reg.Create(validCreation()) // operator "Alice"
+
+	// "alice" (lowercase) is a different name from "Alice".
+	_, err := reg.Apply(Request{IncidentID: "INC-1", ActionID: "a1", Operator: "o", ExpectedVersion: 1, Type: ActionAddParticipant, Content: "alice"})
+	if err != nil {
+		t.Fatalf("add lowercase alice: %v", err)
+	}
+	inc, _ := reg.Get("INC-1")
+	if len(inc.Participants) != 2 {
+		t.Fatalf("case-different names must coexist: %v", inc.Participants)
+	}
+}
+
+func TestRemoveParticipantRules(t *testing.T) {
+	reg, _, _ := newTestRegistry(&fakeEvents{})
+	_, _ = reg.Create(validCreation()) // Alice is owner
+	_, _ = reg.Apply(Request{IncidentID: "INC-1", ActionID: "a1", Operator: "o", ExpectedVersion: 1, Type: ActionAddParticipant, Content: "bob"})
+
+	// Remove non-existent -> conflict.
+	_, err := reg.Apply(Request{IncidentID: "INC-1", ActionID: "r1", Operator: "o", ExpectedVersion: 2, Type: ActionRemoveParticipant, Content: "ghost"})
+	if !IsConflictError(err) {
+		t.Fatalf("remove missing: want conflict, got %v", err)
+	}
+	// Remove current owner -> conflict.
+	_, err = reg.Apply(Request{IncidentID: "INC-1", ActionID: "r2", Operator: "o", ExpectedVersion: 2, Type: ActionRemoveParticipant, Content: "Alice"})
+	if !IsConflictError(err) {
+		t.Fatalf("remove owner: want conflict, got %v", err)
+	}
+	// Remove bob -> ok.
+	_, err = reg.Apply(Request{IncidentID: "INC-1", ActionID: "r3", Operator: "o", ExpectedVersion: 2, Type: ActionRemoveParticipant, Content: "bob"})
+	if err != nil {
+		t.Fatalf("remove bob: %v", err)
+	}
+	inc, _ := reg.Get("INC-1")
+	if len(inc.Participants) != 1 || inc.Participants[0] != "Alice" {
+		t.Fatalf("after remove: %v", inc.Participants)
+	}
+}
+
+func TestAssignOwnerRules(t *testing.T) {
+	reg, _, _ := newTestRegistry(&fakeEvents{})
+	_, _ = reg.Create(validCreation()) // Alice is owner
+	_, _ = reg.Apply(Request{IncidentID: "INC-1", ActionID: "a1", Operator: "o", ExpectedVersion: 1, Type: ActionAddParticipant, Content: "bob"})
+
+	// Assign to non-participant -> conflict.
+	_, err := reg.Apply(Request{IncidentID: "INC-1", ActionID: "o1", Operator: "o", ExpectedVersion: 2, Type: ActionAssignOwner, Content: "ghost"})
+	if !IsConflictError(err) {
+		t.Fatalf("assign to non-participant: want conflict, got %v", err)
+	}
+	// Assign to current owner -> conflict.
+	_, err = reg.Apply(Request{IncidentID: "INC-1", ActionID: "o2", Operator: "o", ExpectedVersion: 2, Type: ActionAssignOwner, Content: "Alice"})
+	if !IsConflictError(err) {
+		t.Fatalf("assign to current owner: want conflict, got %v", err)
+	}
+	// Assign to bob -> ok.
+	res, err := reg.Apply(Request{IncidentID: "INC-1", ActionID: "o3", Operator: "o", ExpectedVersion: 2, Type: ActionAssignOwner, Content: "bob"})
+	if err != nil {
+		t.Fatalf("assign to bob: %v", err)
+	}
+	if res.Version != 3 {
+		t.Fatalf("version %d", res.Version)
+	}
+	inc, _ := reg.Get("INC-1")
+	if inc.Owner != "bob" {
+		t.Fatalf("owner %q", inc.Owner)
+	}
+	// Owner always belongs to participants.
+	found := false
+	for _, p := range inc.Participants {
+		if p == "bob" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("owner must be a participant: %v", inc.Participants)
+	}
+}
+
+func TestParticipantActionsOnlyWhileOpen(t *testing.T) {
+	reg, _, _ := newTestRegistry(&fakeEvents{})
+	_, _ = reg.Create(validCreation())
+	_, _ = reg.Apply(Request{IncidentID: "INC-1", ActionID: "r1", Operator: "o", ExpectedVersion: 1, Type: ActionResolve, Content: "fixed"})
+
+	for _, act := range []string{ActionAddParticipant, ActionRemoveParticipant, ActionAssignOwner} {
+		_, err := reg.Apply(Request{IncidentID: "INC-1", ActionID: "x-" + act, Operator: "o", ExpectedVersion: 2, Type: act, Content: "bob"})
+		if !IsConflictError(err) {
+			t.Fatalf("%s on resolved: want conflict, got %v", act, err)
+		}
+	}
+
+	// Reopen preserves personnel.
+	_, _ = reg.Apply(Request{IncidentID: "INC-1", ActionID: "o1", Operator: "o", ExpectedVersion: 2, Type: ActionReopen, Content: "again"})
+	inc, _ := reg.Get("INC-1")
+	if len(inc.Participants) != 1 || inc.Owner != "Alice" {
+		t.Fatalf("reopen must preserve personnel: %v %q", inc.Participants, inc.Owner)
+	}
+}
+
+func TestNoteOperatorNotAutoAdded(t *testing.T) {
+	reg, _, _ := newTestRegistry(&fakeEvents{})
+	_, _ = reg.Create(validCreation()) // Alice
+	_, _ = reg.Apply(Request{IncidentID: "INC-1", ActionID: "n1", Operator: "bob", ExpectedVersion: 1, Type: ActionNote, Content: "c"})
+
+	inc, _ := reg.Get("INC-1")
+	if len(inc.Participants) != 1 || inc.Participants[0] != "Alice" {
+		t.Fatalf("note operator must not be auto-added: %v", inc.Participants)
+	}
+}
+
+func TestParticipantActionContentIsNormalized(t *testing.T) {
+	reg, _, _ := newTestRegistry(&fakeEvents{})
+	_, _ = reg.Create(validCreation())
+	_, _ = reg.Apply(Request{IncidentID: "INC-1", ActionID: "a1", Operator: "o", ExpectedVersion: 1, Type: ActionAddParticipant, Content: "  bob  "})
+
+	inc, _ := reg.Get("INC-1")
+	entry := inc.History[len(inc.History)-1]
+	if entry.Content != "bob" {
+		t.Fatalf("history content must be normalized: %q", entry.Content)
+	}
+	if entry.Action != ActionAddParticipant {
+		t.Fatalf("history action %q", entry.Action)
+	}
+}
+
+func TestParticipantActionIdempotentReplay(t *testing.T) {
+	reg, _, _ := newTestRegistry(&fakeEvents{})
+	_, _ = reg.Create(validCreation())
+	first := Request{IncidentID: "INC-1", ActionID: "a1", Operator: "o", ExpectedVersion: 1, Type: ActionAddParticipant, Content: "bob"}
+	res, err := reg.Apply(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Advance with another action.
+	_, _ = reg.Apply(Request{IncidentID: "INC-1", ActionID: "a2", Operator: "o", ExpectedVersion: 2, Type: ActionAddParticipant, Content: "zoe"})
+
+	// Replay returns first result and changes nothing.
+	replay, err := reg.Apply(first)
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if replay != res {
+		t.Fatalf("replay %+v want %+v", replay, res)
+	}
+	inc, _ := reg.Get("INC-1")
+	if inc.Version != 3 || len(inc.History) != 3 {
+		t.Fatalf("replay must not add a record: %+v", inc)
+	}
+
+	// Same action id with different content -> conflict.
+	_, err = reg.Apply(Request{IncidentID: "INC-1", ActionID: "a1", Operator: "o", ExpectedVersion: 3, Type: ActionAddParticipant, Content: "changed"})
+	if !IsConflictError(err) {
+		t.Fatalf("changed replay: want conflict, got %v", err)
+	}
+}
+
+func TestParticipantActionValidation(t *testing.T) {
+	reg, _, _ := newTestRegistry(&fakeEvents{})
+	_, _ = reg.Create(validCreation())
+
+	for _, act := range []string{ActionAddParticipant, ActionRemoveParticipant, ActionAssignOwner} {
+		// Empty participant -> validation error.
+		_, err := reg.Apply(Request{IncidentID: "INC-1", ActionID: "a", Operator: "o", ExpectedVersion: 1, Type: act, Content: "  "})
+		if !IsValidationError(err) {
+			t.Fatalf("%s empty participant: want validation, got %v", act, err)
+		}
+	}
+}

@@ -21,11 +21,14 @@ const (
 // Actions accepted by POST /incidents/{id}/actions. ActionCreate marks the
 // creation entry in an incident's history.
 const (
-	ActionCreate    = "create"
-	ActionNote      = "add_note"
-	ActionLinkEvent = "link_event"
-	ActionResolve   = "resolve"
-	ActionReopen    = "reopen"
+	ActionCreate            = "create"
+	ActionNote              = "add_note"
+	ActionLinkEvent         = "link_event"
+	ActionResolve           = "resolve"
+	ActionReopen            = "reopen"
+	ActionAddParticipant    = "add_participant"
+	ActionRemoveParticipant = "remove_participant"
+	ActionAssignOwner       = "assign_owner"
 )
 
 // ValidationError reports missing fields, wrong types, or unknown actions.
@@ -138,13 +141,15 @@ type Entry struct {
 
 // Incident is one committed snapshot, suitable for a single-version read.
 type Incident struct {
-	ID      string
-	Title   string
-	Service string
-	Status  string
-	Version int
-	Links   []string
-	History []Entry
+	ID           string
+	Title        string
+	Service      string
+	Status       string
+	Version      int
+	Links        []string
+	History      []Entry
+	Participants []string
+	Owner        string
 }
 
 // EventLookup resolves an event id without exposing the whole timeline, so
@@ -179,6 +184,12 @@ type incidentState struct {
 
 	links   []string
 	linkSet map[string]struct{}
+
+	// participants is kept sorted and deduped; participantSet mirrors it for
+	// membership tests. owner always belongs to participantSet.
+	participants   []string
+	participantSet map[string]struct{}
+	owner          string
 
 	history []Entry
 	// actions remembers each successful action's normalized request and the
@@ -257,7 +268,8 @@ func NormalizeRequest(input Request) (Request, error) {
 		return Request{}, validationErr("expected_version must be a positive integer")
 	}
 	switch input.Type {
-	case ActionNote, ActionLinkEvent, ActionResolve, ActionReopen:
+	case ActionNote, ActionLinkEvent, ActionResolve, ActionReopen,
+		ActionAddParticipant, ActionRemoveParticipant, ActionAssignOwner:
 	default:
 		return Request{}, validationErr("unknown action %q", input.Type)
 	}
@@ -275,6 +287,8 @@ func actionContentField(action string) string {
 		return "event_id"
 	case ActionResolve, ActionReopen:
 		return "reason"
+	case ActionAddParticipant, ActionRemoveParticipant, ActionAssignOwner:
+		return "participant"
 	default:
 		return "content"
 	}
@@ -402,6 +416,30 @@ func (r *Registry) checkAction(state *incidentState, req Request) error {
 		if state.status != StatusResolved {
 			return conflictErr(state.version, "incident %q is not resolved", state.id)
 		}
+	case ActionAddParticipant, ActionRemoveParticipant, ActionAssignOwner:
+		if state.status != StatusOpen {
+			return conflictErr(state.version, "cannot %s a %s incident", req.Type, state.status)
+		}
+		switch req.Type {
+		case ActionAddParticipant:
+			if _, exists := state.participantSet[req.Content]; exists {
+				return conflictErr(state.version, "participant %q already exists", req.Content)
+			}
+		case ActionRemoveParticipant:
+			if _, exists := state.participantSet[req.Content]; !exists {
+				return conflictErr(state.version, "participant %q does not exist", req.Content)
+			}
+			if state.owner == req.Content {
+				return conflictErr(state.version, "cannot remove current owner %q", req.Content)
+			}
+		case ActionAssignOwner:
+			if _, exists := state.participantSet[req.Content]; !exists {
+				return conflictErr(state.version, "participant %q does not exist", req.Content)
+			}
+			if state.owner == req.Content {
+				return conflictErr(state.version, "participant %q is already owner", req.Content)
+			}
+		}
 	}
 	return nil
 }
@@ -420,16 +458,19 @@ func (r *Registry) Get(id string) (Incident, error) {
 
 func newIncidentState(creation Creation, at time.Time) *incidentState {
 	return &incidentState{
-		id:       creation.ID,
-		title:    creation.Title,
-		service:  creation.Service,
-		status:   StatusOpen,
-		version:  1,
-		links:    []string{},
-		linkSet:  make(map[string]struct{}),
-		actions:  make(map[string]committedAction),
-		history:  []Entry{{Operator: creation.Operator, Action: ActionCreate, Content: creation.Title, Version: 1, At: at}},
-		creation: creation,
+		id:             creation.ID,
+		title:          creation.Title,
+		service:        creation.Service,
+		status:         StatusOpen,
+		version:        1,
+		links:          []string{},
+		linkSet:        make(map[string]struct{}),
+		participants:   []string{creation.Operator},
+		participantSet: map[string]struct{}{creation.Operator: {}},
+		owner:          creation.Operator,
+		actions:        make(map[string]committedAction),
+		history:        []Entry{{Operator: creation.Operator, Action: ActionCreate, Content: creation.Title, Version: 1, At: at}},
+		creation:       creation,
 	}
 }
 
@@ -444,6 +485,17 @@ func (s *incidentState) commit(req Request, at time.Time) int {
 		s.status = StatusResolved
 	case ActionReopen:
 		s.status = StatusOpen
+	case ActionAddParticipant:
+		s.participantSet[req.Content] = struct{}{}
+		s.participants = append(s.participants, req.Content)
+		slices.Sort(s.participants)
+	case ActionRemoveParticipant:
+		delete(s.participantSet, req.Content)
+		s.participants = slices.DeleteFunc(s.participants, func(name string) bool {
+			return name == req.Content
+		})
+	case ActionAssignOwner:
+		s.owner = req.Content
 	}
 	s.version++
 	s.history = append(s.history, Entry{
@@ -460,15 +512,18 @@ func (s *incidentState) commit(req Request, at time.Time) int {
 
 func (s *incidentState) snapshot() Incident {
 	links := slices.Clone(s.links)
+	participants := slices.Clone(s.participants)
 	history := make([]Entry, len(s.history))
 	copy(history, s.history)
 	return Incident{
-		ID:      s.id,
-		Title:   s.title,
-		Service: s.service,
-		Status:  s.status,
-		Version: s.version,
-		Links:   links,
-		History: history,
+		ID:           s.id,
+		Title:        s.title,
+		Service:      s.service,
+		Status:       s.status,
+		Version:      s.version,
+		Links:        links,
+		History:      history,
+		Participants: participants,
+		Owner:        s.owner,
 	}
 }

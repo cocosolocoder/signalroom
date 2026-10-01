@@ -271,9 +271,17 @@ incident. Actions are:
   event may be linked to several incidents. Linking never modifies the event.
 - `resolve` with a non-empty `reason`.
 - `reopen` with a non-empty `reason`.
+- `add_participant` with `participant`; adds a person to the incident.
+- `remove_participant` with `participant`; removes a person. The current
+  owner cannot be removed.
+- `assign_owner` with `participant`; hands ownership to a participant. The
+  target must already be a participant and must not be the current owner.
 
-While `open`, notes, links, and resolve are accepted. While `resolved`, only
-reopen is; anything else is `409`.
+While `open`, notes, links, resolve, and the participant/owner actions are
+accepted. While `resolved`, only reopen is; anything else is `409`.
+Participant and owner names are trimmed of surrounding whitespace (their
+case is kept, so `Alice` and `alice` are different names) and must be
+non-empty afterwards.
 
 `expected_version` is optimistic concurrency: it must equal the incident's
 current committed version. Two different actions submitted at the same
@@ -285,7 +293,8 @@ version cannot both succeed; the loser gets `409` with the current version:
 
 On success `200` returns `{"incident_id","action_id","version"}`, where
 `version` is the incident's version after the action (the previous version
-plus one). Status, links, and history all advance together.
+plus one). Status, links, history, participants, and owner all advance
+together.
 
 A request is idempotent on `(incident id, action id)`. Re-submitting a
 successful action with the same normalized content — operator and submitted
@@ -294,11 +303,13 @@ version, even though that expected version is now stale; concurrent identical
 submissions produce exactly one record. The same `action_id` with different
 content is `409`.
 
-Status codes: `400` for a missing field, wrong type, or unknown action;
-`404` when the incident (or, for a link, the event) does not exist; `409`
-for a stale version, a state-machine violation, a cross-service or duplicate
-link, or replayed-but-changed content. A rejected request never changes the
-incident.
+Status codes: `400` for a missing field, wrong type, unknown action, or a
+payload carrying fields that belong to other actions; `404` when the incident
+(or, for a link, the event) does not exist; `409` for a stale version, a
+state-machine violation, a cross-service or duplicate link, a duplicate
+participant, removing a missing person or the owner, assigning to a
+non-participant or the current owner, or replayed-but-changed content. A
+rejected request never changes the incident.
 
 ### GET /incidents/{id}
 
@@ -312,6 +323,8 @@ Return one incident:
   "status": "resolved",
   "version": 4,
   "events": [ { "id": "evt-1", "...": "full stored event content" } ],
+  "participants": ["alice", "bob"],
+  "owner": "alice",
   "history": [
     {"operator":"alice","action":"create","content":"Checkout outage","version":1,"at":"2026-10-02T08:00:00.123456789Z"},
     {"action_id":"n1","operator":"bob","action":"add_note","content":"investigating","version":2,"at":"..."},
@@ -322,12 +335,16 @@ Return one incident:
 ```
 
 `events` lists every linked event with its full stored content in link order;
-an empty list is `[]`. `history` covers the creation and every successful
-action in commit order. The creation entry records the operator, action
-`create`, the title as its `content`, version `1`, and the server time, and
-has no `action_id`; later entries also carry their `action_id`. Every `at` is
-UTC RFC3339Nano. The whole response is one committed snapshot, so its status
-and history always belong to the same version. An unknown id is `404`.
+an empty list is `[]`. `participants` lists every participant in
+lexicographic order, deduped; the creator is the sole participant at
+creation time. `owner` is the current responsible person and always belongs
+to `participants`. `history` covers the creation and every successful action
+in commit order. The creation entry records the operator, action `create`,
+the title as its `content`, version `1`, and the server time, and has no
+`action_id`; later entries also carry their `action_id`. Every `at` is UTC
+RFC3339Nano. The whole response is one committed snapshot, so its status,
+participants, owner, and history always belong to the same version. An
+unknown id is `404`.
 
 Incidents are stored in their own append-only `incidents.log` in the same
 data directory, under the same durability and recovery rules as

@@ -184,3 +184,109 @@ func TestReplayRejectsInconsistentLog(t *testing.T) {
 		}
 	})
 }
+
+func TestReplayRebuildsParticipantState(t *testing.T) {
+	times := []time.Time{
+		time.Date(2026, 10, 1, 12, 0, 0, 1, time.UTC),
+		time.Date(2026, 10, 1, 12, 0, 0, 2, time.UTC),
+		time.Date(2026, 10, 1, 12, 0, 0, 3, time.UTC),
+		time.Date(2026, 10, 1, 12, 0, 0, 4, time.UTC),
+	}
+	records := []Record{
+		NewCreationRecord(Creation{ID: "I1", Title: "T", Service: "svc", Operator: "alice"}, times[0]),
+		NewActionRecord(Request{IncidentID: "I1", ActionID: "a1", Operator: "bob", ExpectedVersion: 1, Type: ActionAddParticipant, Content: "zoe"}, times[1]),
+		NewActionRecord(Request{IncidentID: "I1", ActionID: "a2", Operator: "bob", ExpectedVersion: 2, Type: ActionAddParticipant, Content: "bob"}, times[2]),
+		NewActionRecord(Request{IncidentID: "I1", ActionID: "o1", Operator: "bob", ExpectedVersion: 3, Type: ActionAssignOwner, Content: "zoe"}, times[3]),
+	}
+
+	reg := NewRegistry(nil, nil)
+	for _, record := range records {
+		if err := reg.Load(record); err != nil {
+			t.Fatalf("load: %v", err)
+		}
+	}
+	inc, err := reg.Get("I1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"alice", "bob", "zoe"}
+	if len(inc.Participants) != len(want) {
+		t.Fatalf("participants %v want %v", inc.Participants, want)
+	}
+	for i := range want {
+		if inc.Participants[i] != want[i] {
+			t.Fatalf("participants %v want %v", inc.Participants, want)
+		}
+	}
+	if inc.Owner != "zoe" {
+		t.Fatalf("owner %q", inc.Owner)
+	}
+	if inc.Version != 4 {
+		t.Fatalf("version %d", inc.Version)
+	}
+
+	// After replay, an idempotent retry returns the first result.
+	replay := Request{IncidentID: "I1", ActionID: "a1", Operator: "bob", ExpectedVersion: 1, Type: ActionAddParticipant, Content: "zoe"}
+	res, err := reg.Apply(replay)
+	if err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if res.Version != 2 {
+		t.Fatalf("retry version %d want 2", res.Version)
+	}
+	inc, _ = reg.Get("I1")
+	if inc.Version != 4 || len(inc.History) != 4 {
+		t.Fatalf("retry must not change state: %+v", inc)
+	}
+}
+
+func TestReplayRejectsInconsistentParticipantLog(t *testing.T) {
+	base := func() *Registry { return NewRegistry(nil, nil) }
+	creation := func(at time.Time) Record {
+		return NewCreationRecord(Creation{ID: "I1", Title: "T", Service: "svc", Operator: "alice"}, at)
+	}
+	t0 := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+
+	t.Run("add duplicate participant", func(t *testing.T) {
+		reg := base()
+		_ = reg.Load(creation(t0))
+		_ = reg.Load(NewActionRecord(Request{IncidentID: "I1", ActionID: "a1", Operator: "o", ExpectedVersion: 1, Type: ActionAddParticipant, Content: "bob"}, t0.Add(time.Second)))
+		err := reg.Load(NewActionRecord(Request{IncidentID: "I1", ActionID: "a2", Operator: "o", ExpectedVersion: 2, Type: ActionAddParticipant, Content: "bob"}, t0.Add(2*time.Second)))
+		if err == nil {
+			t.Fatal("duplicate participant add must fail recovery")
+		}
+	})
+	t.Run("remove missing participant", func(t *testing.T) {
+		reg := base()
+		_ = reg.Load(creation(t0))
+		err := reg.Load(NewActionRecord(Request{IncidentID: "I1", ActionID: "r1", Operator: "o", ExpectedVersion: 1, Type: ActionRemoveParticipant, Content: "ghost"}, t0.Add(time.Second)))
+		if err == nil {
+			t.Fatal("remove missing participant must fail recovery")
+		}
+	})
+	t.Run("remove owner", func(t *testing.T) {
+		reg := base()
+		_ = reg.Load(creation(t0))
+		err := reg.Load(NewActionRecord(Request{IncidentID: "I1", ActionID: "r1", Operator: "o", ExpectedVersion: 1, Type: ActionRemoveParticipant, Content: "alice"}, t0.Add(time.Second)))
+		if err == nil {
+			t.Fatal("remove owner must fail recovery")
+		}
+	})
+	t.Run("assign owner to non-participant", func(t *testing.T) {
+		reg := base()
+		_ = reg.Load(creation(t0))
+		err := reg.Load(NewActionRecord(Request{IncidentID: "I1", ActionID: "o1", Operator: "o", ExpectedVersion: 1, Type: ActionAssignOwner, Content: "ghost"}, t0.Add(time.Second)))
+		if err == nil {
+			t.Fatal("assign owner to non-participant must fail recovery")
+		}
+	})
+	t.Run("participant action on resolved incident", func(t *testing.T) {
+		reg := base()
+		_ = reg.Load(creation(t0))
+		_ = reg.Load(NewActionRecord(Request{IncidentID: "I1", ActionID: "r1", Operator: "o", ExpectedVersion: 1, Type: ActionResolve, Content: "fixed"}, t0.Add(time.Second)))
+		err := reg.Load(NewActionRecord(Request{IncidentID: "I1", ActionID: "a1", Operator: "o", ExpectedVersion: 2, Type: ActionAddParticipant, Content: "bob"}, t0.Add(2*time.Second)))
+		if err == nil {
+			t.Fatal("participant action on resolved incident must fail recovery")
+		}
+	})
+}
