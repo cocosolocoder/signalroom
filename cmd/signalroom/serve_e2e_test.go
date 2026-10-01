@@ -449,6 +449,63 @@ func TestServeFailsOnMidCorruptionWithoutMutation(t *testing.T) {
 	}
 }
 
+func TestServeCompareAcrossRestart(t *testing.T) {
+	dataDir := t.TempDir()
+	p := startServer(t, dataDir)
+	postEvents(t, p, `{"events":[
+		{"id":"b1","service":"gateway","severity":"critical","message":"m","at":"2026-10-01T10:00:00.123456789Z"},
+		{"id":"o1","service":"gateway","severity":"critical","message":"m","at":"2026-10-01T10:11:00Z"}
+	]}`)
+
+	query := "/events/compare?" +
+		"baseline_since=2026-10-01T10:00:00.123456789Z&baseline_until=2026-10-01T10:10:00.123456789Z" +
+		"&since=2026-10-01T10:10:00.123456789Z&until=2026-10-01T10:20:00.123456789Z&step=240"
+	status, raw := httpDo(t, http.MethodGet, "http://"+p.addr+query, "")
+	if status != http.StatusOK {
+		t.Fatalf("compare status %d: %s", status, raw)
+	}
+	var before map[string]any
+	if err := json.Unmarshal(raw, &before); err != nil {
+		t.Fatal(err)
+	}
+	if before["baseline_total"].(float64) != 1 || before["observation_total"].(float64) != 1 {
+		t.Fatalf("compare totals: %v", before)
+	}
+	seg := before["segments"].([]any)[0].(map[string]any)
+	if seg["baseline_since"] != "2026-10-01T10:00:00.123456789Z" {
+		t.Fatalf("segment start must preserve nanoseconds in UTC: %v", seg)
+	}
+
+	// Late event committed after the first request must land in its segment
+	// on the next request, and the result must survive a restart unchanged.
+	postEvents(t, p, `{"events":[{"id":"late","service":"gateway","severity":"info","message":"m","at":"2026-10-01T10:02:00Z"}]}`)
+	p.signal(t, syscall.SIGTERM)
+	p.waitExit(t, 0)
+	waitTCPPortClosed(t, p.addr)
+
+	p2 := startServer(t, dataDir)
+	status, raw = httpDo(t, http.MethodGet, "http://"+p2.addr+query, "")
+	if status != http.StatusOK {
+		t.Fatalf("compare after restart status %d: %s", status, raw)
+	}
+	var after map[string]any
+	if err := json.Unmarshal(raw, &after); err != nil {
+		t.Fatal(err)
+	}
+	if after["baseline_total"].(float64) != 2 || after["observation_total"].(float64) != 1 {
+		t.Fatalf("late event must count in its segment after restart: %v", after)
+	}
+	first := after["segments"].([]any)[0].(map[string]any)
+	if first["baseline_count"].(float64) != 2 {
+		t.Fatalf("late event belongs to segment 0: %v", first)
+	}
+	if after["difference"].(float64) != -1 {
+		t.Fatalf("difference: %v", after)
+	}
+	p2.signal(t, syscall.SIGTERM)
+	p2.waitExit(t, 0)
+}
+
 func TestServeHTTPErrorsAreJSON(t *testing.T) {
 	p := startServer(t, t.TempDir())
 	status, raw := httpDo(t, http.MethodPost, "http://"+p.addr+"/events", `{"events":[]}`)

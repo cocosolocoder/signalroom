@@ -3,12 +3,15 @@ package httpapi
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/cocosolocoder/signalroom/internal/events"
 )
@@ -310,5 +313,311 @@ func TestEmptyTimelineReturnsEmptyArray(t *testing.T) {
 	arr, ok := rows.([]any)
 	if !ok || len(arr) != 0 {
 		t.Fatalf("want [], got %v", rows)
+	}
+}
+
+func compareQuery() url.Values {
+	q := url.Values{}
+	q.Set("baseline_since", "2026-10-01T10:00:00Z")
+	q.Set("baseline_until", "2026-10-01T10:10:00Z")
+	q.Set("since", "2026-10-01T10:10:00Z")
+	q.Set("until", "2026-10-01T10:20:00Z")
+	q.Set("step", "240")
+	return q
+}
+
+func getCompare(t *testing.T, server *httptest.Server, values url.Values) (int, map[string]any) {
+	t.Helper()
+	resp, err := http.Get(server.URL + "/events/compare?" + values.Encode())
+	if err != nil {
+		t.Fatalf("get compare: %v", err)
+	}
+	defer resp.Body.Close()
+	return decode(t, resp)
+}
+
+func TestCompareHTTPTotalsSegmentsAndUTC(t *testing.T) {
+	server, _, _ := newTestServer(t)
+	seed := `{"events":[
+		{"id":"b1","service":"gateway","severity":"critical","message":"m","at":"2026-10-01T10:00:00Z"},
+		{"id":"b2","service":"api","severity":"info","message":"m","at":"2026-10-01T10:03:00Z"},
+		{"id":"o1","service":"gateway","severity":"critical","message":"m","at":"2026-10-01T10:11:00Z"},
+		{"id":"o2","service":"api","severity":"info","message":"m","at":"2026-10-01T10:19:00Z"}
+	]}`
+	if status, _ := post(t, server, seed); status != http.StatusOK {
+		t.Fatal("seed")
+	}
+
+	status, body := getCompare(t, server, compareQuery())
+	if status != http.StatusOK {
+		t.Fatalf("status=%d body=%v", status, body)
+	}
+	if body["baseline_total"].(float64) != 2 || body["observation_total"].(float64) != 2 {
+		t.Fatalf("totals: %v", body)
+	}
+	if body["difference"].(float64) != 0 {
+		t.Fatalf("difference: %v", body)
+	}
+	if body["ratio"].(float64) != 0 {
+		t.Fatalf("ratio: %v", body)
+	}
+	segments := body["segments"].([]any)
+	if len(segments) != 3 {
+		t.Fatalf("want 3 segments, got %d", len(segments))
+	}
+	want := []map[string]any{
+		{"baseline_since": "2026-10-01T10:00:00Z", "baseline_until": "2026-10-01T10:04:00Z", "since": "2026-10-01T10:10:00Z", "until": "2026-10-01T10:14:00Z", "baseline_count": float64(2), "observation_count": float64(1), "difference": float64(-1)},
+		{"baseline_since": "2026-10-01T10:04:00Z", "baseline_until": "2026-10-01T10:08:00Z", "since": "2026-10-01T10:14:00Z", "until": "2026-10-01T10:18:00Z", "baseline_count": float64(0), "observation_count": float64(0), "difference": float64(0)},
+		{"baseline_since": "2026-10-01T10:08:00Z", "baseline_until": "2026-10-01T10:10:00Z", "since": "2026-10-01T10:18:00Z", "until": "2026-10-01T10:20:00Z", "baseline_count": float64(0), "observation_count": float64(1), "difference": float64(1)},
+	}
+	for i, wantSeg := range want {
+		got := segments[i].(map[string]any)
+		for key, wantVal := range wantSeg {
+			if got[key] != wantVal {
+				t.Fatalf("segment %d %s: want %v, got %v", i, key, wantVal, got[key])
+			}
+		}
+	}
+}
+
+func TestCompareHTTPFilters(t *testing.T) {
+	server, _, _ := newTestServer(t)
+	seed := `{"events":[
+		{"id":"b1","service":"gateway","severity":"critical","message":"m","at":"2026-10-01T10:00:00Z"},
+		{"id":"b2","service":"api","severity":"info","message":"m","at":"2026-10-01T10:00:00Z"},
+		{"id":"o1","service":"gateway","severity":"critical","message":"m","at":"2026-10-01T10:11:00Z"},
+		{"id":"o2","service":"api","severity":"info","message":"m","at":"2026-10-01T10:11:00Z"}
+	]}`
+	post(t, server, seed)
+	q := compareQuery()
+	q.Set("service", "gateway")
+	q.Set("severity", "CRITICAL")
+	status, body := getCompare(t, server, q)
+	if status != http.StatusOK {
+		t.Fatalf("status=%d body=%v", status, body)
+	}
+	if body["baseline_total"].(float64) != 1 || body["observation_total"].(float64) != 1 {
+		t.Fatalf("filters must apply: %v", body)
+	}
+}
+
+func TestCompareHTTPTimezoneEquivalence(t *testing.T) {
+	server, _, _ := newTestServer(t)
+	// 10:00+08:00 == 02:00 UTC; windows are expressed in +08:00 local time.
+	post(t, server, `{"events":[{"id":"e","service":"s","severity":"info","message":"m","at":"2026-10-01T10:00:00.123456789+08:00"}]}`)
+	q := url.Values{}
+	q.Set("baseline_since", "2026-10-01T10:00:00+08:00")
+	q.Set("baseline_until", "2026-10-01T20:00:00+08:00")
+	q.Set("since", "2026-10-01T10:00:00+08:00")
+	q.Set("until", "2026-10-01T20:00:00+08:00")
+	q.Set("step", "36000")
+	status, body := getCompare(t, server, q)
+	if status != http.StatusOK {
+		t.Fatalf("status=%d body=%v", status, body)
+	}
+	if body["baseline_total"].(float64) != 1 || body["observation_total"].(float64) != 1 {
+		t.Fatalf("same instant in another zone must count: %v", body)
+	}
+	seg := body["segments"].([]any)[0].(map[string]any)
+	if seg["baseline_since"] != "2026-10-01T02:00:00Z" || seg["baseline_until"] != "2026-10-01T12:00:00Z" {
+		t.Fatalf("output must be UTC: %v", seg)
+	}
+}
+
+func TestCompareHTTPZeroBaselineRatioNull(t *testing.T) {
+	server, _, _ := newTestServer(t)
+	post(t, server, `{"events":[{"id":"e","service":"s","severity":"info","message":"m","at":"2026-10-01T10:11:00Z"}]}`)
+	status, body := getCompare(t, server, compareQuery())
+	if status != http.StatusOK {
+		t.Fatalf("status=%d body=%v", status, body)
+	}
+	if body["baseline_total"].(float64) != 0 || body["observation_total"].(float64) != 1 {
+		t.Fatalf("totals: %v", body)
+	}
+	if body["ratio"] != nil {
+		t.Fatalf("ratio must be null with zero baseline, got %v", body["ratio"])
+	}
+}
+
+func TestCompareHTTPEmptyDataReturnsFullSegments(t *testing.T) {
+	server, _, _ := newTestServer(t)
+	status, body := getCompare(t, server, compareQuery())
+	if status != http.StatusOK {
+		t.Fatalf("status=%d body=%v", status, body)
+	}
+	segments, ok := body["segments"].([]any)
+	if !ok || len(segments) != 3 {
+		t.Fatalf("empty data must still return 3 segments, got %v", body["segments"])
+	}
+	for _, raw := range segments {
+		seg := raw.(map[string]any)
+		if seg["baseline_count"].(float64) != 0 || seg["observation_count"].(float64) != 0 || seg["difference"].(float64) != 0 {
+			t.Fatalf("empty segments must show zero counts: %v", seg)
+		}
+	}
+}
+
+func TestCompareHTTPValidation(t *testing.T) {
+	server, _, _ := newTestServer(t)
+	cases := map[string]url.Values{
+		"missing baseline_since": func() url.Values { q := compareQuery(); q.Del("baseline_since"); return q }(),
+		"missing baseline_until": func() url.Values { q := compareQuery(); q.Del("baseline_until"); return q }(),
+		"missing since":          func() url.Values { q := compareQuery(); q.Del("since"); return q }(),
+		"missing until":          func() url.Values { q := compareQuery(); q.Del("until"); return q }(),
+		"missing step":           func() url.Values { q := compareQuery(); q.Del("step"); return q }(),
+		"duplicate baseline_since": func() url.Values {
+			q := compareQuery()
+			q.Add("baseline_since", "2026-10-01T09:00:00Z")
+			return q
+		}(),
+		"duplicate step": func() url.Values {
+			q := compareQuery()
+			q.Add("step", "60")
+			return q
+		}(),
+		"unparsable baseline_since": func() url.Values { q := compareQuery(); q.Set("baseline_since", "banana"); return q }(),
+		"unparsable step":          func() url.Values { q := compareQuery(); q.Set("step", "abc"); return q }(),
+		"step zero":                func() url.Values { q := compareQuery(); q.Set("step", "0"); return q }(),
+		"step negative":            func() url.Values { q := compareQuery(); q.Set("step", "-60"); return q }(),
+		"step too large":           func() url.Values { q := compareQuery(); q.Set("step", "86401"); return q }(),
+		"step fractional":          func() url.Values { q := compareQuery(); q.Set("step", "1.5"); return q }(),
+		"step with suffix":         func() url.Values { q := compareQuery(); q.Set("step", "60s"); return q }(),
+		"baseline inverted": func() url.Values {
+			q := compareQuery()
+			q.Set("baseline_since", "2026-10-01T10:10:00Z")
+			q.Set("baseline_until", "2026-10-01T10:00:00Z")
+			return q
+		}(),
+		"observation inverted": func() url.Values {
+			q := compareQuery()
+			q.Set("since", "2026-10-01T10:20:00Z")
+			q.Set("until", "2026-10-01T10:10:00Z")
+			return q
+		}(),
+		"unequal lengths": func() url.Values {
+			q := compareQuery()
+			q.Set("until", "2026-10-01T10:21:00Z")
+			return q
+		}(),
+		"too many segments": func() url.Values {
+			q := url.Values{}
+			q.Set("baseline_since", "2026-10-01T10:00:00Z")
+			q.Set("baseline_until", "2026-10-01T12:46:41Z") // 9999 seconds
+			q.Set("since", "2026-10-01T10:00:00Z")
+			q.Set("until", "2026-10-01T12:46:41Z")
+			q.Set("step", "1")
+			return q
+		}(),
+	}
+	for name, query := range cases {
+		t.Run(name, func(t *testing.T) {
+			status, body := getCompare(t, server, query)
+			if status != http.StatusBadRequest {
+				t.Fatalf("want 400, got %d (%v)", status, body)
+			}
+			if msg, _ := body["error"].(string); msg == "" {
+				t.Fatal("error response needs a non-empty error string")
+			}
+		})
+	}
+
+	// Exactly 10000 segments is allowed; 10001 is rejected.
+	okQuery := url.Values{}
+	okQuery.Set("baseline_since", "2026-10-01T10:00:00Z")
+	okQuery.Set("baseline_until", "2026-10-01T12:46:40Z") // 10000 seconds
+	okQuery.Set("since", "2026-10-01T10:00:00Z")
+	okQuery.Set("until", "2026-10-01T12:46:40Z")
+	okQuery.Set("step", "1")
+	status, _ := getCompare(t, server, okQuery)
+	if status != http.StatusOK {
+		t.Fatalf("10000 segments must be allowed, got %d", status)
+	}
+}
+
+func TestCompareHTTPStorageFailureReturns503(t *testing.T) {
+	server, store, _ := newTestServer(t)
+	store.failNext = true
+	post(t, server, `{"events":[{"id":"a","service":"s","severity":"info","message":"m","at":"2026-10-01T09:00:00Z"}]}`)
+	status, body := getCompare(t, server, compareQuery())
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("poisoned storage must return 503, got %d (%v)", status, body)
+	}
+}
+
+func TestCompareHTTPMethodNotAllowed(t *testing.T) {
+	server, _, _ := newTestServer(t)
+	req, _ := http.NewRequest(http.MethodPost, server.URL+"/events/compare", strings.NewReader("{}"))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("POST /events/compare must be 405, got %d", resp.StatusCode)
+	}
+}
+
+func TestCompareHTTPConsistentSnapshotUnderWrites(t *testing.T) {
+	server, _, _ := newTestServer(t)
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for k := 0; ; k++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				body := fmt.Sprintf(
+					`{"events":[{"id":"w%d-%d","service":"svc","severity":"info","message":"m","at":"2026-10-01T10:0%d:00Z"}]}`,
+					i, k, (i+k)%10,
+				)
+				if status, _ := post(t, server, body); status != http.StatusOK {
+					t.Errorf("writer %d: status %d", i, status)
+					return
+				}
+			}
+		}(i)
+	}
+
+	deadline := make(chan struct{})
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		close(deadline)
+	}()
+	for {
+		select {
+		case <-deadline:
+			close(stop)
+			wg.Wait()
+			return
+		default:
+		}
+		status, body := getCompare(t, server, compareQuery())
+		if status != http.StatusOK {
+			t.Fatalf("status %d: %v", status, body)
+		}
+		segments := body["segments"].([]any)
+		var baselineSum, observationSum float64
+		for _, raw := range segments {
+			seg := raw.(map[string]any)
+			bc := seg["baseline_count"].(float64)
+			oc := seg["observation_count"].(float64)
+			baselineSum += bc
+			observationSum += oc
+			if seg["difference"].(float64) != oc-bc {
+				t.Fatalf("segment difference inconsistent: %v", seg)
+			}
+		}
+		if baselineSum != body["baseline_total"].(float64) || observationSum != body["observation_total"].(float64) {
+			t.Fatalf("totals disagree with segment sums: %v", body)
+		}
+		if body["difference"].(float64) != body["observation_total"].(float64)-body["baseline_total"].(float64) {
+			t.Fatalf("total difference inconsistent: %v", body)
+		}
 	}
 }

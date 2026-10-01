@@ -76,6 +76,50 @@ curl -sS 'localhost:8080/events?service=gateway&severity=critical&since=2026-10-
 All error responses are JSON objects with a non-empty `error` string, e.g.
 `{"error":"event id already exists with different content"}`.
 
+### GET /events/compare
+
+Compare event counts across two equal-length windows. Required query
+parameters:
+
+- `baseline_since`, `baseline_until` — the baseline window.
+- `since`, `until` — the observation window.
+- `step` — segment width as a decimal integer of seconds from 1 to 86400.
+
+All four instants are RFC3339Nano timestamps; each window must start before
+it ends and both windows must have the same length. Windows and segments
+contain their start and exclude their end, and segments are aligned from each
+window's start, with the final partial segment ending at the window end. The
+windows may overlap; an event in the overlap counts on both sides but only
+once per side. Time equality uses absolute instants, and all output times are
+UTC RFC3339Nano.
+
+The `service` and `severity` filters follow the same rules as `GET /events`;
+only filtered events are counted. A window requiring more than 10000 segments
+is rejected with `400`.
+
+```bash
+curl -sS 'localhost:8080/events/compare?baseline_since=2026-10-01T10:00:00Z&baseline_until=2026-10-01T10:10:00Z&since=2026-10-01T10:10:00Z&until=2026-10-01T10:20:00Z&step=240'
+```
+
+```json
+{
+  "baseline_total": 2,
+  "observation_total": 2,
+  "difference": 0,
+  "ratio": 0,
+  "segments": [
+    {"baseline_since": "2026-10-01T10:00:00Z", "baseline_until": "2026-10-01T10:04:00Z", "since": "2026-10-01T10:10:00Z", "until": "2026-10-01T10:14:00Z", "baseline_count": 2, "observation_count": 1, "difference": -1},
+    {"baseline_since": "2026-10-01T10:04:00Z", "baseline_until": "2026-10-01T10:08:00Z", "since": "2026-10-01T10:14:00Z", "until": "2026-10-01T10:18:00Z", "baseline_count": 0, "observation_count": 0, "difference": 0},
+    {"baseline_since": "2026-10-01T10:08:00Z", "baseline_until": "2026-10-01T10:10:00Z", "since": "2026-10-01T10:18:00Z", "until": "2026-10-01T10:20:00Z", "baseline_count": 0, "observation_count": 1, "difference": 1}
+  ]
+}
+```
+
+`ratio` is the observation-minus-baseline difference divided by the baseline
+total, as a number (not a percentage string); it is `null` when the baseline
+total is zero. Empty windows still return the full segment list with zero
+counts.
+
 ## Test
 
 ```bash

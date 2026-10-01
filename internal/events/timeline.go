@@ -4,6 +4,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 // BeforeCommit persists a batch of brand-new events. It runs while the
@@ -153,4 +154,133 @@ func sameEvent(a, b Event) bool {
 		a.Severity == b.Severity &&
 		a.Message == b.Message &&
 		a.At.Equal(b.At)
+}
+
+// CompareQuery describes two equal-length windows counted side by side. The
+// baseline window is [BaselineSince, BaselineUntil) and the observation window
+// is [Since, Until); Step is the segment width both windows are aligned to.
+type CompareQuery struct {
+	Service       string
+	Severity      string
+	BaselineSince time.Time
+	BaselineUntil time.Time
+	Since         time.Time
+	Until         time.Time
+	Step          time.Duration
+}
+
+// CompareSegment is one aligned interval of the two windows. Every interval
+// contains its start and excludes its end; the final interval ends at the
+// window end.
+type CompareSegment struct {
+	BaselineSince    time.Time
+	BaselineUntil    time.Time
+	Since            time.Time
+	Until            time.Time
+	BaselineCount    int
+	ObservationCount int
+	Difference       int
+}
+
+// CompareResult holds the per-side totals, the observation-minus-baseline
+// difference, the ratio (nil when the baseline total is zero), and the
+// aligned segments ordered from each window's start.
+type CompareResult struct {
+	BaselineTotal    int
+	ObservationTotal int
+	Difference       int
+	Ratio            *float64
+	Segments         []CompareSegment
+}
+
+// Compare counts the filtered events in the baseline and observation windows
+// in one consistent snapshot, then aligns the counts by step-sized segments
+// from each window's start. Both windows must be equal in length; segments
+// contain their start and exclude their end, and the final segment ends at
+// the window end. Overlapping windows count an event on both sides, but never
+// twice within one side.
+func (t *Timeline) Compare(query CompareQuery) CompareResult {
+	service := strings.TrimSpace(query.Service)
+	severity := strings.ToLower(strings.TrimSpace(query.Severity))
+
+	stepNs := int64(query.Step)
+	baselineCounts := make([]int, SegmentCount(query.BaselineSince, query.BaselineUntil, query.Step))
+	observationCounts := make([]int, len(baselineCounts))
+
+	// One lock-held pass keeps both sides, the totals, and every segment on
+	// the same committed version of the timeline.
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	var baselineTotal, observationTotal int
+	for _, event := range t.events {
+		if service != "" && event.Service != service {
+			continue
+		}
+		if severity != "" && event.Severity != severity {
+			continue
+		}
+		if index, ok := segmentIndex(query.BaselineSince, query.BaselineUntil, stepNs, event.At); ok {
+			baselineCounts[index]++
+			baselineTotal++
+		}
+		if index, ok := segmentIndex(query.Since, query.Until, stepNs, event.At); ok {
+			observationCounts[index]++
+			observationTotal++
+		}
+	}
+
+	segments := make([]CompareSegment, len(baselineCounts))
+	for i := range segments {
+		segments[i] = CompareSegment{
+			BaselineSince:    query.BaselineSince.Add(time.Duration(int64(i) * stepNs)),
+			BaselineUntil:    segmentEnd(query.BaselineSince, query.BaselineUntil, stepNs, i),
+			Since:            query.Since.Add(time.Duration(int64(i) * stepNs)),
+			Until:            segmentEnd(query.Since, query.Until, stepNs, i),
+			BaselineCount:    baselineCounts[i],
+			ObservationCount: observationCounts[i],
+			Difference:       observationCounts[i] - baselineCounts[i],
+		}
+	}
+
+	difference := observationTotal - baselineTotal
+	result := CompareResult{
+		BaselineTotal:    baselineTotal,
+		ObservationTotal: observationTotal,
+		Difference:       difference,
+		Segments:         segments,
+	}
+	if baselineTotal > 0 {
+		ratio := float64(difference) / float64(baselineTotal)
+		result.Ratio = &ratio
+	}
+	return result
+}
+
+// SegmentCount returns the number of step-sized segments in [start, end),
+// rounding the final partial segment up to the window end.
+func SegmentCount(start, end time.Time, step time.Duration) int {
+	length := int64(end.Sub(start))
+	segments := length / int64(step)
+	if length%int64(step) != 0 {
+		segments++
+	}
+	return int(segments)
+}
+
+// segmentIndex returns the segment containing at within [start, end); the
+// instant at the window end or outside the window belongs to no segment.
+func segmentIndex(start, end time.Time, stepNs int64, at time.Time) (int, bool) {
+	if at.Before(start) || !at.Before(end) {
+		return 0, false
+	}
+	return int(int64(at.Sub(start)) / stepNs), true
+}
+
+// segmentEnd returns the end of segment i, clipped to the window end.
+func segmentEnd(start, end time.Time, stepNs int64, i int) time.Time {
+	finish := start.Add(time.Duration(int64(i+1) * stepNs))
+	if finish.After(end) {
+		return end
+	}
+	return finish
 }

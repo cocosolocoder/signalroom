@@ -315,3 +315,182 @@ func TestIngestBatchAtomicVisibility(t *testing.T) {
 		t.Fatalf("final timeline: %d events", len(got))
 	}
 }
+
+func TestSegmentCount(t *testing.T) {
+	base := time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC)
+	cases := []struct {
+		length time.Duration
+		step   time.Duration
+		want   int
+	}{
+		{10 * time.Minute, 4 * time.Minute, 3},
+		{4 * time.Minute, 4 * time.Minute, 1},
+		{4*time.Minute + time.Nanosecond, 4 * time.Minute, 2},
+		{time.Second, time.Second, 1},
+		{10000 * time.Second, time.Second, 10000},
+	}
+	for i, tc := range cases {
+		if got := SegmentCount(base, base.Add(tc.length), tc.step); got != tc.want {
+			t.Fatalf("case %d: want %d segments, got %d", i, tc.want, got)
+		}
+	}
+}
+
+func TestCompareSegmentsCountsAndBoundaries(t *testing.T) {
+	tl := NewTimeline()
+	base := time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC)
+	obsStart := base.Add(10 * time.Minute)
+	step := 4 * time.Minute
+	nanos := func(seconds int) time.Time {
+		return base.Add(time.Duration(seconds)*time.Second + time.Duration(seconds%7)*time.Nanosecond)
+	}
+	batch := []Event{
+		mkEvent("b0a", "svc", "info", "m", base),
+		mkEvent("b0b", "svc", "info", "m", nanos(180)),
+		mkEvent("b1a", "svc", "info", "m", base.Add(4*time.Minute)), // exact segment boundary -> segment 1
+		mkEvent("b1b", "svc", "info", "m", nanos(420)),
+		mkEvent("b2", "svc", "info", "m", base.Add(8*time.Minute)), // boundary -> segment 2
+		mkEvent("o0a", "svc", "info", "m", obsStart),
+		mkEvent("o0b", "svc", "info", "m", obsStart.Add(time.Minute)),
+		mkEvent("o2", "svc", "info", "m", obsStart.Add(9*time.Minute)),
+		mkEvent("out", "svc", "info", "m", obsStart.Add(10*time.Minute)), // end-exclusive: dropped
+	}
+	if _, err := tl.Ingest(batch, nil); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+
+	result := tl.Compare(CompareQuery{
+		BaselineSince: base,
+		BaselineUntil: obsStart,
+		Since:         obsStart,
+		Until:         obsStart.Add(10 * time.Minute),
+		Step:          step,
+	})
+	if result.BaselineTotal != 5 || result.ObservationTotal != 3 {
+		t.Fatalf("totals: baseline=%d observation=%d", result.BaselineTotal, result.ObservationTotal)
+	}
+	if result.Difference != -2 {
+		t.Fatalf("difference=%d", result.Difference)
+	}
+	if result.Ratio == nil || *result.Ratio != -0.4 {
+		t.Fatalf("ratio=%v", result.Ratio)
+	}
+	if len(result.Segments) != 3 {
+		t.Fatalf("want 3 segments, got %d", len(result.Segments))
+	}
+	wantCounts := [][2]int{{2, 2}, {2, 0}, {1, 1}}
+	for i, seg := range result.Segments {
+		if seg.BaselineCount != wantCounts[i][0] || seg.ObservationCount != wantCounts[i][1] {
+			t.Fatalf("segment %d counts: %+v", i, seg)
+		}
+		if seg.Difference != seg.ObservationCount-seg.BaselineCount {
+			t.Fatalf("segment %d difference: %d", i, seg.Difference)
+		}
+	}
+	// Segment 0 spans [start, start+step); the final segment is clipped to
+	// the window end and keeps the partial width.
+	s0 := result.Segments[0]
+	if !s0.BaselineSince.Equal(base) || !s0.BaselineUntil.Equal(base.Add(step)) {
+		t.Fatalf("segment 0 baseline span: %v..%v", s0.BaselineSince, s0.BaselineUntil)
+	}
+	s2 := result.Segments[2]
+	if !s2.BaselineSince.Equal(base.Add(8*time.Minute)) || !s2.BaselineUntil.Equal(obsStart) {
+		t.Fatalf("segment 2 baseline span: %v..%v", s2.BaselineSince, s2.BaselineUntil)
+	}
+	if !s2.Since.Equal(obsStart.Add(8*time.Minute)) || !s2.Until.Equal(obsStart.Add(10*time.Minute)) {
+		t.Fatalf("segment 2 observation span: %v..%v", s2.Since, s2.Until)
+	}
+}
+
+func TestCompareOverlapCountsEventOnBothSides(t *testing.T) {
+	tl := NewTimeline()
+	base := time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC)
+	if _, err := tl.Ingest([]Event{mkEvent("e", "s", "info", "m", base.Add(2*time.Minute))}, nil); err != nil {
+		t.Fatal(err)
+	}
+	result := tl.Compare(CompareQuery{
+		BaselineSince: base,
+		BaselineUntil: base.Add(10 * time.Minute),
+		Since:         base,
+		Until:         base.Add(10 * time.Minute),
+		Step:          5 * time.Minute,
+	})
+	if result.BaselineTotal != 1 || result.ObservationTotal != 1 || result.Difference != 0 {
+		t.Fatalf("overlap must count the event on both sides: %+v", result)
+	}
+	if len(result.Segments) != 2 {
+		t.Fatalf("segments=%d", len(result.Segments))
+	}
+	if result.Segments[0].BaselineCount != 1 || result.Segments[0].ObservationCount != 1 {
+		t.Fatalf("event belongs to segment 0 on both sides: %+v", result.Segments[0])
+	}
+}
+
+func TestCompareFilters(t *testing.T) {
+	tl := NewTimeline()
+	base := time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC)
+	batch := []Event{
+		mkEvent("a", "gateway", "critical", "m", base.Add(time.Minute)),
+		mkEvent("b", "api", "info", "m", base.Add(time.Minute)),
+		mkEvent("c", "gateway", "info", "m", base.Add(time.Minute)),
+	}
+	if _, err := tl.Ingest(batch, nil); err != nil {
+		t.Fatal(err)
+	}
+	result := tl.Compare(CompareQuery{
+		Service:       "gateway",
+		Severity:      " CRITICAL ",
+		BaselineSince: base,
+		BaselineUntil: base.Add(10 * time.Minute),
+		Since:         base,
+		Until:         base.Add(10 * time.Minute),
+		Step:          10 * time.Minute,
+	})
+	if result.BaselineTotal != 1 || result.ObservationTotal != 1 {
+		t.Fatalf("filters must apply before counting: %+v", result)
+	}
+}
+
+func TestCompareZeroBaselineRatioNil(t *testing.T) {
+	tl := NewTimeline()
+	base := time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC)
+	if _, err := tl.Ingest([]Event{mkEvent("e", "s", "info", "m", base.Add(11*time.Minute))}, nil); err != nil {
+		t.Fatal(err)
+	}
+	result := tl.Compare(CompareQuery{
+		BaselineSince: base,
+		BaselineUntil: base.Add(10 * time.Minute),
+		Since:         base.Add(10 * time.Minute),
+		Until:         base.Add(20 * time.Minute),
+		Step:          10 * time.Minute,
+	})
+	if result.BaselineTotal != 0 || result.ObservationTotal != 1 {
+		t.Fatalf("totals: %+v", result)
+	}
+	if result.Ratio != nil {
+		t.Fatalf("ratio with zero baseline must be nil, got %v", *result.Ratio)
+	}
+	if len(result.Segments) != 1 || result.Segments[0].BaselineCount != 0 || result.Segments[0].ObservationCount != 1 {
+		t.Fatalf("segments: %+v", result.Segments)
+	}
+}
+
+func TestCompareAbsoluteInstants(t *testing.T) {
+	tl := NewTimeline()
+	// 10:00 in +08:00 is 02:00 UTC.
+	at := time.Date(2026, 10, 1, 10, 0, 0, 0, time.FixedZone("CST", 8*60*60))
+	if _, err := tl.Ingest([]Event{mkEvent("e", "s", "info", "m", at)}, nil); err != nil {
+		t.Fatal(err)
+	}
+	windowStart := time.Date(2026, 10, 1, 2, 0, 0, 0, time.UTC)
+	result := tl.Compare(CompareQuery{
+		BaselineSince: windowStart,
+		BaselineUntil: windowStart.Add(time.Hour),
+		Since:         windowStart,
+		Until:         windowStart.Add(time.Hour),
+		Step:          time.Hour,
+	})
+	if result.BaselineTotal != 1 || result.ObservationTotal != 1 {
+		t.Fatalf("same instant in another zone must count identically: %+v", result)
+	}
+}
