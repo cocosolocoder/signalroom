@@ -18,6 +18,9 @@ type fakeStorage struct {
 	failNext bool
 	poisoned bool
 	appended []int
+
+	cursorKey []byte
+	snapshots map[string][]byte
 }
 
 func (f *fakeStorage) Append(batch []events.Event) error {
@@ -41,11 +44,37 @@ func (f *fakeStorage) Poisoned() bool {
 	return f.poisoned
 }
 
+func (f *fakeStorage) CursorKey() []byte {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.cursorKey
+}
+
+func (f *fakeStorage) SaveSnapshot(id string, payload []byte) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.snapshots == nil {
+		f.snapshots = make(map[string][]byte)
+	}
+	f.snapshots[id] = append([]byte(nil), payload...)
+	return nil
+}
+
+func (f *fakeStorage) LoadSnapshot(id string) ([]byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	payload, ok := f.snapshots[id]
+	if !ok {
+		return nil, errors.New("snapshot not found")
+	}
+	return append([]byte(nil), payload...), nil
+}
+
 func newTestServer(t *testing.T) (*httptest.Server, *fakeStorage, *events.Timeline) {
 	t.Helper()
 	tl := events.NewTimeline()
-	store := &fakeStorage{}
-	server := httptest.NewServer(NewHandler(tl, store))
+	store := &fakeStorage{cursorKey: []byte("test-cursor-key-0123456789ab")}
+	server := httptest.NewServer(NewHandler(tl, store, store))
 	t.Cleanup(server.Close)
 	return server, store, tl
 }

@@ -150,6 +150,55 @@ func (t *Timeline) Query(query Query) []Event {
 	return result
 }
 
+// SnapshotIDs returns the ids of events matching the optional filters, in
+// time-then-id order. The set is taken under the timeline lock, so a batch
+// committed concurrently is either fully present or fully absent; events
+// added after the call never appear in the returned set, which makes it
+// suitable for stable pagination across later writes.
+func (t *Timeline) SnapshotIDs(query Query) []string {
+	service := strings.TrimSpace(query.Service)
+	severity := strings.ToLower(strings.TrimSpace(query.Severity))
+
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	ids := make([]string, 0, len(t.events))
+	for _, event := range t.events {
+		if service != "" && event.Service != service {
+			continue
+		}
+		if severity != "" && event.Severity != severity {
+			continue
+		}
+		if !query.Since.IsZero() && event.At.Before(query.Since) {
+			continue
+		}
+		if !query.Until.IsZero() && event.At.After(query.Until) {
+			continue
+		}
+		if !labelsMatch(event.Labels, query.Labels) {
+			continue
+		}
+		ids = append(ids, event.ID)
+	}
+	return ids
+}
+
+// EventsByID returns the events for ids in the requested order. Every id
+// must refer to a stored event; events are never removed, so a set captured
+// by SnapshotIDs stays resolvable. Missing ids are skipped only when the
+// caller passes ids not produced by SnapshotIDs.
+func (t *Timeline) EventsByID(ids []string) []Event {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	out := make([]Event, 0, len(ids))
+	for _, id := range ids {
+		if event, ok := t.byID[id]; ok {
+			out = append(out, event)
+		}
+	}
+	return out
+}
+
 // sameEvent compares two normalized events on their absolute instant and
 // their labels. Normalized label sets are nil when empty, so the three "no
 // labels" spellings compare equal, and map comparison makes key order and

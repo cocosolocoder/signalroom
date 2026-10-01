@@ -92,6 +92,39 @@ events without labels omit the field. Optional query parameters:
 curl -sS 'localhost:8080/events?service=gateway&severity=critical&label=env=prod&label=version=v2&since=2026-10-01T00:00:00Z&until=2026-10-02T00:00:00Z'
 ```
 
+### GET /events/page
+
+Browse a large result set one page at a time. The first request captures the
+committed set of events matching the filters; later requests continue from
+that same set, so events written during paging never appear mid-query.
+
+Filter parameters have the same meaning as `GET /events`: `service`,
+`severity`, `since`, `until`, and `label`. A request without a cursor starts a
+fresh query; a request with one continues the query it names.
+
+- `limit` — page size. Omitted defaults to `100`; only decimal integers from
+  `1` to `1000` are accepted. A continuation may change the limit and resumes
+  from the same position.
+- `cursor` — the opaque token from the previous response. Omit it to start a
+  new query. Empty, repeated, unparseable, or tampered cursors yield `400`.
+
+The response is `{"events": [...], "next_cursor": "..."}`. Events are ordered
+by time then id and carry their full labels; `next_cursor` is `null` when the
+set has no more records, and an empty result is `{"events":[],"next_cursor":null}`.
+
+A continuation without filter parameters reuses the first page's filters. If
+any filter parameter is present, the full filter set is checked against the
+first page's; a different set yields `400`. Differences that normalize away
+(whitespace, severity case, label order, timezone representation) are
+considered the same. Cursors survive a normal restart or a process kill in
+the same data directory and are rejected by any other directory.
+
+```bash
+curl -sS 'localhost:8080/events/page?limit=2'
+# {"events":[...],"next_cursor":"eyJ..."}
+curl -sS 'localhost:8080/events/page?limit=2&cursor=eyJ...'
+```
+
 ### GET /events/compare
 
 Compare event volume between a baseline window and an observation window,

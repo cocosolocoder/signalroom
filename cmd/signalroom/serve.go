@@ -51,7 +51,7 @@ func runServe(args []string) error {
 	}
 
 	server := &http.Server{
-		Handler:           httpapi.NewHandler(timeline, log),
+		Handler:           httpapi.NewHandler(timeline, log, log),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	serverErr := make(chan error, 1)

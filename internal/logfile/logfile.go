@@ -40,6 +40,8 @@ type Log struct {
 	mu       sync.Mutex
 	file     *os.File
 	lockFile *os.File
+	dir      string
+	key      []byte
 	poisoned bool
 }
 
@@ -120,7 +122,15 @@ func Open(dir string) (*Log, [][]events.Event, error) {
 		return nil, nil, fmt.Errorf("sync data directory: %w", err)
 	}
 
-	return &Log{file: file, lockFile: lockFile}, batches, nil
+	key, err := loadOrCreateKey(dir)
+	if err != nil {
+		file.Close()
+		unlock(lockFile)
+		lockFile.Close()
+		return nil, nil, err
+	}
+
+	return &Log{file: file, lockFile: lockFile, dir: dir, key: key}, batches, nil
 }
 
 // replay scans the log and returns the valid batches, the byte offset at

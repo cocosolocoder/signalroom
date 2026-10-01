@@ -519,3 +519,153 @@ func TestServeHTTPErrorsAreJSON(t *testing.T) {
 	p.signal(t, syscall.SIGTERM)
 	p.waitExit(t, 0)
 }
+
+// pageResponse is the decoded body of GET /events/page.
+type pageResponse struct {
+	Events     []map[string]any `json:"events"`
+	NextCursor *string          `json:"next_cursor"`
+}
+
+func pageGet(t *testing.T, p *serverProc, query string) (int, pageResponse) {
+	t.Helper()
+	status, raw := httpDo(t, http.MethodGet, "http://"+p.addr+"/events/page"+query, "")
+	var out pageResponse
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("decode %q: %v", raw, err)
+	}
+	return status, out
+}
+
+func TestServePageSurvivesRestart(t *testing.T) {
+	dataDir := t.TempDir()
+	p := startServer(t, dataDir)
+	postEvents(t, p, `{"events":[
+		{"id":"e1","service":"s","severity":"info","message":"m","at":"2026-10-01T09:00:00Z"},
+		{"id":"e2","service":"s","severity":"info","message":"m","at":"2026-10-01T09:01:00Z"},
+		{"id":"e3","service":"s","severity":"info","message":"m","at":"2026-10-01T09:02:00Z"}
+	]}`)
+
+	// First page.
+	status, out := pageGet(t, p, "?limit=1")
+	if status != http.StatusOK {
+		t.Fatalf("page: %d", status)
+	}
+	if len(out.Events) != 1 || out.Events[0]["id"] != "e1" {
+		t.Fatalf("first page: %v", out.Events)
+	}
+	if out.NextCursor == nil {
+		t.Fatal("first page should have a next_cursor")
+	}
+
+	// Hard kill and restart: the cursor must remain usable.
+	p.signal(t, syscall.SIGKILL)
+	p.waitExit(t, -1)
+	waitTCPPortClosed(t, p.addr)
+
+	p2 := startServer(t, dataDir)
+	status, out = pageGet(t, p2, "?limit=1&cursor="+*out.NextCursor)
+	if status != http.StatusOK {
+		t.Fatalf("page after restart: %d", status)
+	}
+	if len(out.Events) != 1 || out.Events[0]["id"] != "e2" {
+		t.Fatalf("page after restart: %v", out.Events)
+	}
+	p2.signal(t, syscall.SIGTERM)
+	p2.waitExit(t, 0)
+}
+
+func TestServePageCursorRejectedByOtherDir(t *testing.T) {
+	dir1 := t.TempDir()
+	dir2 := t.TempDir()
+	p1 := startServer(t, dir1)
+	p2 := startServer(t, dir2)
+	postEvents(t, p1, `{"events":[
+		{"id":"e1","service":"s","severity":"info","message":"m","at":"2026-10-01T09:00:00Z"},
+		{"id":"e2","service":"s","severity":"info","message":"m","at":"2026-10-01T09:01:00Z"}
+	]}`)
+
+	_, out := pageGet(t, p1, "?limit=1")
+	if out.NextCursor == nil {
+		t.Fatal("expected a next_cursor")
+	}
+
+	// dir1's cursor must be rejected by dir2.
+	status, raw := httpDo(t, http.MethodGet, "http://"+p2.addr+"/events/page?limit=1&cursor="+*out.NextCursor, "")
+	if status != http.StatusBadRequest {
+		t.Fatalf("cursor from another dir should be 400, got %d %s", status, raw)
+	}
+	var errBody map[string]string
+	if err := json.Unmarshal(raw, &errBody); err != nil || errBody["error"] == "" {
+		t.Fatalf("error body: %s", raw)
+	}
+	p1.signal(t, syscall.SIGTERM)
+	p1.waitExit(t, 0)
+	p2.signal(t, syscall.SIGTERM)
+	p2.waitExit(t, 0)
+}
+
+func TestServePageWorksOnLegacyDataDir(t *testing.T) {
+	// A data directory written by an older version has events.log but no
+	// cursor.key or snapshots/. The new server must generate the key and
+	// page through the recovered events.
+	dataDir := t.TempDir()
+	payload := []byte(`[{"id":"e1","service":"s","severity":"info","message":"m","at":"2026-10-01T09:00:00Z"},{"id":"e2","service":"s","severity":"info","message":"m","at":"2026-10-01T09:01:00Z"}]`)
+	frame := make([]byte, 8+len(payload))
+	binary.BigEndian.PutUint32(frame[0:4], uint32(len(payload)))
+	binary.BigEndian.PutUint32(frame[4:8], crc32.ChecksumIEEE(payload))
+	copy(frame[8:], payload)
+	if err := os.WriteFile(filepath.Join(dataDir, "events.log"), frame, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	p := startServer(t, dataDir)
+	status, out := pageGet(t, p, "?limit=1")
+	if status != http.StatusOK {
+		t.Fatalf("page on legacy dir: %d", status)
+	}
+	if len(out.Events) != 1 || out.Events[0]["id"] != "e1" {
+		t.Fatalf("legacy dir first page: %v", out.Events)
+	}
+	if out.NextCursor == nil {
+		t.Fatal("expected a next_cursor")
+	}
+	status, out = pageGet(t, p, "?limit=1&cursor="+*out.NextCursor)
+	if status != http.StatusOK {
+		t.Fatalf("legacy dir second page: %d", status)
+	}
+	if len(out.Events) != 1 || out.Events[0]["id"] != "e2" {
+		t.Fatalf("legacy dir second page: %v", out.Events)
+	}
+	p.signal(t, syscall.SIGTERM)
+	p.waitExit(t, 0)
+}
+
+func TestServePageSnapshotStableAcrossRestart(t *testing.T) {
+	dataDir := t.TempDir()
+	p := startServer(t, dataDir)
+	postEvents(t, p, `{"events":[
+		{"id":"e1","service":"s","severity":"info","message":"m","at":"2026-10-01T09:00:00Z"},
+		{"id":"e2","service":"s","severity":"info","message":"m","at":"2026-10-01T09:02:00Z"}
+	]}`)
+
+	// First page, limit 1.
+	_, out := pageGet(t, p, "?limit=1")
+	if out.NextCursor == nil {
+		t.Fatal("expected a next_cursor")
+	}
+
+	// Restart, then ingest a new event with an earlier time.
+	p.signal(t, syscall.SIGKILL)
+	p.waitExit(t, -1)
+	waitTCPPortClosed(t, p.addr)
+	p2 := startServer(t, dataDir)
+	postEvents(t, p2, `{"events":[{"id":"e0","service":"s","severity":"info","message":"m","at":"2026-10-01T08:00:00Z"}]}`)
+
+	// The old cursor must continue the old snapshot, not see e0.
+	_, out = pageGet(t, p2, "?limit=1&cursor="+*out.NextCursor)
+	if len(out.Events) != 1 || out.Events[0]["id"] != "e2" {
+		t.Fatalf("old cursor must not see post-restart event: %v", out.Events)
+	}
+	p2.signal(t, syscall.SIGTERM)
+	p2.waitExit(t, 0)
+}
