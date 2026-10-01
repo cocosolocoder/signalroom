@@ -640,6 +640,46 @@ func TestServePageWorksOnLegacyDataDir(t *testing.T) {
 	p.waitExit(t, 0)
 }
 
+func TestServePreviewStableAcrossRestart(t *testing.T) {
+	dataDir := t.TempDir()
+	p := startServer(t, dataDir)
+	postEvents(t, p, `{"events":[
+		{"id":"e1","service":"gateway","severity":"critical","message":"m","at":"2026-10-01T10:00:05Z","labels":{"env":"prod"}},
+		{"id":"e2","service":"gateway","severity":"critical","message":"m","at":"2026-10-01T10:01:05Z","labels":{"env":"prod"}},
+		{"id":"e3","service":"api","severity":"info","message":"m","at":"2026-10-01T10:00:05Z"}
+	]}`)
+
+	body := `{"since":"2026-10-01T10:00:00Z","until":"2026-10-01T10:03:00Z",` +
+		`"window_seconds":60,"threshold":1,"trigger_windows":2,"recover_windows":1,` +
+		`"group_labels":["env"]}`
+	_, before := httpDo(t, http.MethodPost, "http://"+p.addr+"/alerts/preview", body)
+
+	p.signal(t, syscall.SIGKILL)
+	p.waitExit(t, -1)
+	waitTCPPortClosed(t, p.addr)
+
+	p2 := startServer(t, dataDir)
+	status, after := httpDo(t, http.MethodPost, "http://"+p2.addr+"/alerts/preview", body)
+	if status != http.StatusOK {
+		t.Fatalf("preview after restart: %d %s", status, after)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("preview differs across restart:\n%s\n%s", before, after)
+	}
+
+	// Replaying an identical batch after restart leaves the preview unchanged.
+	postEvents(t, p2, `{"events":[`+
+		`{"id":"e1","service":"gateway","severity":"critical","message":"m","at":"2026-10-01T10:00:05Z","labels":{"env":"prod"}},`+
+		`{"id":"e2","service":"gateway","severity":"critical","message":"m","at":"2026-10-01T10:01:05Z","labels":{"env":"prod"}},`+
+		`{"id":"e3","service":"api","severity":"info","message":"m","at":"2026-10-01T10:00:05Z"}]}`)
+	_, replayed := httpDo(t, http.MethodPost, "http://"+p2.addr+"/alerts/preview", body)
+	if !bytes.Equal(before, replayed) {
+		t.Fatalf("replaying events changed the preview:\n%s\n%s", before, replayed)
+	}
+	p2.signal(t, syscall.SIGTERM)
+	p2.waitExit(t, 0)
+}
+
 func TestServePageSnapshotStableAcrossRestart(t *testing.T) {
 	dataDir := t.TempDir()
 	p := startServer(t, dataDir)

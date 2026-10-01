@@ -173,6 +173,73 @@ inverted or unequal-length windows, and the 10000-segment limit all return
 `400` with a non-empty `error`. As with the other endpoints, a poisoned store
 returns `503`.
 
+### POST /alerts/preview
+
+Preview when each service would cross an event-count threshold and recover
+again, straight from the already-ingested events. Nothing is sent, no
+incident is created, and no event is modified; the request only reads one
+committed snapshot, so a batch ingested concurrently is either counted in
+full or not at all. Replaying identical events adds nothing, and a late
+arrival is re-bucketed by its own event time on the next preview, so an
+unchanged dataset always yields the same result.
+
+The body is a JSON object with exactly these members (unknown or duplicate
+members are rejected):
+
+- `since`, `until` — required RFC3339Nano instants. The range is half-open
+  (start included, end excluded) and `since` must be strictly before
+  `until`.
+- `window_seconds` — required integer from `1` to `86400`.
+- `threshold` — required integer from `1` to `1000000`.
+- `trigger_windows`, `recover_windows` — required integers from `1` to
+  `100`: how many consecutive windows must be at or above the threshold to
+  open an alert, and how many consecutive windows below it must follow to
+  close one.
+- `service`, `severity` — optional, using the same trimming and
+  case-insensitive rules as `GET /events`.
+- `labels` — optional object of string-to-string conditions, following the
+  ingestion trimming and limit rules; every condition must match.
+- `group_labels` — optional array of at most four label names. Names are
+  trimmed with the label-name rules; duplicates after trimming and invalid
+  or over-limit names are rejected. Present names are reordered
+  lexicographically in the response.
+
+The range is divided from `since` into windows of `window_seconds`; a final
+remainder shorter than a full window still participates. Events are counted
+per service, or per service plus the values of the `group_labels` (events
+missing one of those labels form their own group with `null` for that
+value). Groups exist only for combinations that have a matching event in the
+range, and every group still lists the complete window set with zero counts
+filled in; a range with no matching events returns an empty `groups` array.
+
+Each group starts in the normal state without inheriting anything before
+`since`: a run of `trigger_windows` windows at or above `threshold` opens an
+alert at the last window's end, and one window below the threshold resets the
+run. While alerting, windows at or above the threshold do not open another
+alert, and `recover_windows` consecutive windows below it close the alert at
+that window's end; a threshold-meeting window in between resets the recovery
+run. An alert still open at the range end keeps `recovered_at` as `null` and
+is never closed automatically; a later run can open a new alert after a
+recovery.
+
+`200` returns the sorted group-label names and groups ordered by service,
+then by their label values with `null` before strings; each group carries
+its complete window list (`since`, `until`, `count`, end-of-window
+`status` of `normal` or `alerting`) and its alerts ordered by trigger time
+(`triggered_at`, `recovered_at`). All timestamps are UTC RFC3339Nano.
+
+```bash
+curl -sS -X POST localhost:8080/alerts/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"since":"2026-10-01T10:00:00Z","until":"2026-10-01T11:00:00Z","window_seconds":60,"threshold":5,"trigger_windows":3,"recover_windows":2,"service":"gateway","severity":"critical","labels":{"env":"prod"},"group_labels":["region","version"]}'
+```
+
+Missing required members, wrong types or values, unknown/duplicate JSON
+members, invalid filters or group-label names, a range needing more than
+10000 windows, and a response whose groups would contain more than 100000
+group windows in total all return `400` with a non-empty `error` and never a
+partial result. A poisoned store returns `503`.
+
 All error responses are JSON objects with a non-empty `error` string, e.g.
 `{"error":"event id already exists with different content"}`.
 

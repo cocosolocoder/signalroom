@@ -47,8 +47,23 @@ func NormalizeLabels(labels map[string]string) (map[string]string, error) {
 	return normalized, nil
 }
 
+// NormalizeLabelName applies the name half of the ingestion rules: trim
+// surrounding whitespace and require a non-empty result within the rune
+// limit. Group-by selectors and filter names go through the same gate as
+// stored label names.
+func NormalizeLabelName(name string) (string, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "", &ValidationError{Reason: "label name must not be empty"}
+	}
+	if utf8.RuneCountInString(name) > MaxLabelNameRunes {
+		return "", &ValidationError{Reason: fmt.Sprintf("label name must not exceed %d characters", MaxLabelNameRunes)}
+	}
+	return name, nil
+}
+
 // checkLabel enforces the name/value rules every label and every label
-// filter condition follows.
+// filter condition follows. Callers pass already-trimmed arguments.
 func checkLabel(name, value string) error {
 	if name == "" {
 		return &ValidationError{Reason: "label name must not be empty"}
@@ -83,6 +98,33 @@ func ParseLabelConditions(raw []string) (map[string]string, error) {
 		if !ok {
 			return nil, &ValidationError{Reason: "label filter must use the form name=value"}
 		}
+		name = strings.TrimSpace(name)
+		value = strings.TrimSpace(value)
+		if err := checkLabel(name, value); err != nil {
+			return nil, err
+		}
+		if _, dup := conditions[name]; dup {
+			return nil, &ValidationError{Reason: fmt.Sprintf("label filter %q repeats", name)}
+		}
+		conditions[name] = value
+	}
+	return conditions, nil
+}
+
+// NormalizeLabelConditions trims and validates a decoded object of label
+// conditions: the JSON-object counterpart to ParseLabelConditions. The
+// strict object shape (string values, no duplicate JSON keys) is enforced by
+// DecodeLabelsObject; here names and values pass the same trimming and limit
+// rules, and names colliding after trimming are rejected.
+func NormalizeLabelConditions(raw map[string]string) (map[string]string, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	if len(raw) > MaxLabelFilters {
+		return nil, &ValidationError{Reason: fmt.Sprintf("at most %d label filters are allowed", MaxLabelFilters)}
+	}
+	conditions := make(map[string]string, len(raw))
+	for name, value := range raw {
 		name = strings.TrimSpace(name)
 		value = strings.TrimSpace(value)
 		if err := checkLabel(name, value); err != nil {

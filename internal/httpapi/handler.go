@@ -39,6 +39,7 @@ type Handler struct {
 func NewHandler(timeline *events.Timeline, log Storage, cursors CursorStore) *Handler {
 	h := &Handler{timeline: timeline, log: log, cursors: cursors, mux: http.NewServeMux()}
 	h.mux.HandleFunc("/events", h.events)
+	h.mux.HandleFunc("/alerts/preview", h.previewAlerts)
 	h.mux.HandleFunc("/events/compare", h.compareEvents)
 	h.mux.HandleFunc("/events/page", h.pageEvents)
 	h.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {

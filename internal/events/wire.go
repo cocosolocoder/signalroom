@@ -21,11 +21,19 @@ type eventDTO struct {
 	Labels   map[string]string `json:"labels,omitempty"`
 }
 
-// labelsObject decodes the raw labels member strictly: it must be null or an
-// object whose values are all strings, and duplicate names are rejected
-// instead of silently overwriting each other the way a plain map decode
-// would. Name/value content rules are enforced later by NormalizeLabels.
+// decodeLabels strictly decodes a JSON labels member; DecodeLabelsObject is
+// the exported form used by request bodies that carry the same shape, such as
+// the label filters in an alert preview request.
 func decodeLabels(raw json.RawMessage) (map[string]string, error) {
+	return DecodeLabelsObject(raw)
+}
+
+// DecodeLabelsObject strictly decodes a JSON labels object: null, absent, or
+// an object whose values are all strings, and duplicate names are rejected
+// instead of silently overwriting each other the way a plain map decode
+// would. Name/value content rules are enforced later by NormalizeLabels or
+// filter normalization.
+func DecodeLabelsObject(raw json.RawMessage) (map[string]string, error) {
 	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
 		return nil, nil
 	}
