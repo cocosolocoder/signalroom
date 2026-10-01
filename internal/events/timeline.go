@@ -183,6 +183,16 @@ func (t *Timeline) SnapshotIDs(query Query) []string {
 	return ids
 }
 
+// EventByID returns the event with the given id and whether it exists. The
+// lookup runs under the read lock, so it is safe to call while holding
+// another lock (e.g. the incident store's lock).
+func (t *Timeline) EventByID(id string) (Event, bool) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	event, ok := t.byID[id]
+	return event, ok
+}
+
 // EventsByID returns the events for ids in the requested order. Every id
 // must refer to a stored event; events are never removed, so a set captured
 // by SnapshotIDs stays resolvable. Missing ids are skipped only when the

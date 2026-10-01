@@ -709,3 +709,306 @@ func TestServePageSnapshotStableAcrossRestart(t *testing.T) {
 	p2.signal(t, syscall.SIGTERM)
 	p2.waitExit(t, 0)
 }
+
+// --- Incident e2e tests ---
+
+func postIncidentE2E(t *testing.T, p *serverProc, body string) (int, map[string]any) {
+	t.Helper()
+	status, raw := httpDo(t, http.MethodPost, "http://"+p.addr+"/incidents", body)
+	var out map[string]any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("decode %q: %v", raw, err)
+	}
+	return status, out
+}
+
+func postIncidentActionE2E(t *testing.T, p *serverProc, id, body string) (int, map[string]any) {
+	t.Helper()
+	status, raw := httpDo(t, http.MethodPost, "http://"+p.addr+"/incidents/"+id+"/actions", body)
+	var out map[string]any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("decode %q: %v", raw, err)
+	}
+	return status, out
+}
+
+func getIncidentE2E(t *testing.T, p *serverProc, id string) (int, map[string]any) {
+	t.Helper()
+	status, raw := httpDo(t, http.MethodGet, "http://"+p.addr+"/incidents/"+id, "")
+	var out map[string]any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("decode %q: %v", raw, err)
+	}
+	return status, out
+}
+
+func TestServeIncidentPersistsAcrossKill(t *testing.T) {
+	dataDir := t.TempDir()
+	p := startServer(t, dataDir)
+
+	status, out := postIncidentE2E(t, p, `{"id":"INC-1","title":"Error spike","service":"gateway","operator":"alice"}`)
+	if status != http.StatusOK || out["version"].(float64) != 1 {
+		t.Fatalf("create: %d %v", status, out)
+	}
+	postEvents(t, p, `{"events":[{"id":"evt-1","service":"gateway","severity":"critical","message":"spike","at":"2026-10-01T09:00:00Z"}]}`)
+	postIncidentActionE2E(t, p, "INC-1", `{"action":"add_note","action_id":"ACT-1","operator":"bob","expected_version":1,"content":"investigating"}`)
+	postIncidentActionE2E(t, p, "INC-1", `{"action":"link","action_id":"ACT-2","operator":"bob","expected_version":2,"event_id":"evt-1"}`)
+	postIncidentActionE2E(t, p, "INC-1", `{"action":"resolve","action_id":"ACT-3","operator":"bob","expected_version":3,"reason":"fixed"}`)
+
+	// Hard kill, then restart.
+	p.signal(t, syscall.SIGKILL)
+	p.waitExit(t, -1)
+	waitTCPPortClosed(t, p.addr)
+
+	p2 := startServer(t, dataDir)
+	status, got := getIncidentE2E(t, p2, "INC-1")
+	if status != http.StatusOK {
+		t.Fatalf("get after restart: %d %v", status, got)
+	}
+	if got["status"] != "resolved" || got["version"].(float64) != 4 {
+		t.Fatalf("state after restart: %v", got)
+	}
+	history := got["history"].([]any)
+	if len(history) != 4 {
+		t.Fatalf("history after restart: %d", len(history))
+	}
+	links := got["links"].([]any)
+	if len(links) != 1 || links[0].(map[string]any)["id"] != "evt-1" {
+		t.Fatalf("links after restart: %v", links)
+	}
+
+	// Replay an action after restart: same normalized content, version unchanged.
+	status, replay := postIncidentActionE2E(t, p2, "INC-1", `{"action":"add_note","action_id":"ACT-1","operator":"bob","expected_version":1,"content":"  investigating  "}`)
+	if status != http.StatusOK {
+		t.Fatalf("replay after restart: %d %v", status, replay)
+	}
+	if replay["version"].(float64) != 2 {
+		t.Fatalf("replay version after restart: %v", replay)
+	}
+
+	// Replay create after restart.
+	status, createReplay := postIncidentE2E(t, p2, `{"id":"INC-1","title":"  Error spike  ","service":"  gateway  ","operator":"  alice  "}`)
+	if status != http.StatusOK {
+		t.Fatalf("create replay after restart: %d %v", status, createReplay)
+	}
+	if createReplay["version"].(float64) != 4 {
+		t.Fatalf("create replay version after restart: %v", createReplay)
+	}
+
+	p2.signal(t, syscall.SIGTERM)
+	p2.waitExit(t, 0)
+}
+
+func TestServeIncidentConcurrentActionsOneWins(t *testing.T) {
+	dataDir := t.TempDir()
+	p := startServer(t, dataDir)
+	postIncidentE2E(t, p, `{"id":"INC-1","title":"Title","service":"svc","operator":"alice"}`)
+
+	// Fire many concurrent actions all submitting against version 1.
+	const n = 20
+	var wg sync.WaitGroup
+	results := make([]int, n)
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			defer wg.Done()
+			body := fmt.Sprintf(`{"action":"add_note","action_id":"ACT-%d","operator":"bob","expected_version":1,"content":"note-%d"}`, i, i)
+			status, _ := postIncidentActionE2E(t, p, "INC-1", body)
+			results[i] = status
+		}(i)
+	}
+	wg.Wait()
+
+	ok := 0
+	conflict := 0
+	for _, s := range results {
+		switch s {
+		case http.StatusOK:
+			ok++
+		case http.StatusConflict:
+			conflict++
+		}
+	}
+	if ok != 1 {
+		t.Fatalf("expected exactly one success, got %d (conflicts=%d)", ok, conflict)
+	}
+
+	_, got := getIncidentE2E(t, p, "INC-1")
+	if got["version"].(float64) != 2 {
+		t.Fatalf("version after concurrent actions: %v", got)
+	}
+	if len(got["history"].([]any)) != 2 {
+		t.Fatalf("history after concurrent actions: %v", got["history"])
+	}
+	p.signal(t, syscall.SIGTERM)
+	p.waitExit(t, 0)
+}
+
+func TestServeIncidentConcurrentReplayOneRecord(t *testing.T) {
+	dataDir := t.TempDir()
+	p := startServer(t, dataDir)
+	postIncidentE2E(t, p, `{"id":"INC-1","title":"Title","service":"svc","operator":"alice"}`)
+
+	// Many concurrent resubmissions of the same action.
+	const n = 20
+	var wg sync.WaitGroup
+	results := make([]int, n)
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			defer wg.Done()
+			body := `{"action":"add_note","action_id":"ACT-1","operator":"bob","expected_version":1,"content":"note"}`
+			status, _ := postIncidentActionE2E(t, p, "INC-1", body)
+			results[i] = status
+		}(i)
+	}
+	wg.Wait()
+
+	for _, s := range results {
+		if s != http.StatusOK {
+			t.Fatalf("replay should all succeed, got status %d", s)
+		}
+	}
+	_, got := getIncidentE2E(t, p, "INC-1")
+	if got["version"].(float64) != 2 {
+		t.Fatalf("version after concurrent replay: %v", got)
+	}
+	if len(got["history"].([]any)) != 2 {
+		t.Fatalf("history after concurrent replay: %v", got["history"])
+	}
+	p.signal(t, syscall.SIGTERM)
+	p.waitExit(t, 0)
+}
+
+func TestServeIncidentLegacyDataDir(t *testing.T) {
+	// A data directory with only events.log (no incidents.log) must serve
+	// incidents normally: the incident log is created on first write.
+	dataDir := t.TempDir()
+	payload := []byte(`[{"id":"e1","service":"s","severity":"info","message":"m","at":"2026-10-01T09:00:00Z"}]`)
+	frame := make([]byte, 8+len(payload))
+	binary.BigEndian.PutUint32(frame[0:4], uint32(len(payload)))
+	binary.BigEndian.PutUint32(frame[4:8], crc32.ChecksumIEEE(payload))
+	copy(frame[8:], payload)
+	if err := os.WriteFile(filepath.Join(dataDir, "events.log"), frame, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	p := startServer(t, dataDir)
+	status, out := postIncidentE2E(t, p, `{"id":"INC-1","title":"Title","service":"s","operator":"alice"}`)
+	if status != http.StatusOK {
+		t.Fatalf("create on legacy dir: %d %v", status, out)
+	}
+	p.signal(t, syscall.SIGTERM)
+	p.waitExit(t, 0)
+
+	// Restart and verify the incident survived.
+	p2 := startServer(t, dataDir)
+	status, got := getIncidentE2E(t, p2, "INC-1")
+	if status != http.StatusOK || got["version"].(float64) != 1 {
+		t.Fatalf("incident after restart on legacy dir: %d %v", status, got)
+	}
+	p2.signal(t, syscall.SIGTERM)
+	p2.waitExit(t, 0)
+}
+
+func TestServeIncidentDoesNotModifyEvents(t *testing.T) {
+	dataDir := t.TempDir()
+	p := startServer(t, dataDir)
+	postEvents(t, p, `{"events":[{"id":"evt-1","service":"gateway","severity":"critical","message":"spike","at":"2026-10-01T09:00:00Z"}]}`)
+	postIncidentE2E(t, p, `{"id":"INC-1","title":"Title","service":"gateway","operator":"alice"}`)
+	postIncidentActionE2E(t, p, "INC-1", `{"action":"link","action_id":"ACT-1","operator":"bob","expected_version":1,"event_id":"evt-1"}`)
+
+	// The event must be unchanged.
+	events := getEvents(t, p, "")
+	if len(events) != 1 || events[0]["id"] != "evt-1" || events[0]["severity"] != "critical" {
+		t.Fatalf("event modified by incident link: %+v", events)
+	}
+	p.signal(t, syscall.SIGTERM)
+	p.waitExit(t, 0)
+}
+
+func TestServeIncidentTornTailDiscarded(t *testing.T) {
+	dataDir := t.TempDir()
+	p := startServer(t, dataDir)
+	postIncidentE2E(t, p, `{"id":"INC-1","title":"Title","service":"svc","operator":"alice"}`)
+	p.signal(t, syscall.SIGKILL)
+	p.waitExit(t, -1)
+	waitTCPPortClosed(t, p.addr)
+
+	// Append a torn partial frame to incidents.log.
+	path := filepath.Join(dataDir, "incidents.log")
+	existing, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte(`{"kind":"action","id":"INC-1","action_id":"ACT-1"}`)
+	torn := make([]byte, 8+4)
+	binary.BigEndian.PutUint32(torn[0:4], uint32(len(payload)))
+	binary.BigEndian.PutUint32(torn[4:8], crc32.ChecksumIEEE(payload))
+	copy(torn[8:], payload[:4])
+	if err := os.WriteFile(path, append(existing, torn...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	p2 := startServer(t, dataDir)
+	status, got := getIncidentE2E(t, p2, "INC-1")
+	if status != http.StatusOK || got["version"].(float64) != 1 {
+		t.Fatalf("torn tail not discarded: %d %v", status, got)
+	}
+	p2.signal(t, syscall.SIGTERM)
+	p2.waitExit(t, 0)
+}
+
+func TestServeIncidentCorruptionFatalWithoutMutation(t *testing.T) {
+	dataDir := t.TempDir()
+	p := startServer(t, dataDir)
+	postIncidentE2E(t, p, `{"id":"INC-1","title":"Title","service":"svc","operator":"alice"}`)
+	p.signal(t, syscall.SIGKILL)
+	p.waitExit(t, -1)
+	waitTCPPortClosed(t, p.addr)
+
+	// Corrupt the incidents.log checksum.
+	path := filepath.Join(dataDir, "incidents.log")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := append([]byte(nil), data...)
+	data[8] ^= 0xFF
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	logs := &safeBuffer{}
+	failing := exec.Command(binaryPath, "serve", "--addr", "127.0.0.1:0", "--data", dataDir)
+	failing.Stdout = logs
+	failing.Stderr = logs
+	if err := failing.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- failing.Wait() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("corrupt incident log must prevent startup")
+		}
+		if ee, ok := err.(*exec.ExitError); !ok || ee.ExitCode() == 0 {
+			t.Fatalf("corrupt incident log must exit non-zero: %v", err)
+		}
+	case <-ctx.Done():
+		failing.Process.Kill()
+		t.Fatal("server stayed up despite corrupt incident log")
+	}
+
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, data) {
+		t.Fatal("failed startup must not modify corrupt data")
+	}
+	_ = original
+}

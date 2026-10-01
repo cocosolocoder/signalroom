@@ -14,6 +14,7 @@ import (
 
 	"github.com/cocosolocoder/signalroom/internal/events"
 	"github.com/cocosolocoder/signalroom/internal/httpapi"
+	"github.com/cocosolocoder/signalroom/internal/incidents"
 	"github.com/cocosolocoder/signalroom/internal/logfile"
 )
 
@@ -45,13 +46,23 @@ func runServe(args []string) error {
 	}
 	timeline.SortAll()
 
+	incidentLog, incidentRecords, err := incidents.OpenLog(*dataDir)
+	if err != nil {
+		return err
+	}
+	defer incidentLog.Close()
+	incidentStore := incidents.NewStore(incidentLog, timeline)
+	if err := incidentStore.Load(incidentRecords); err != nil {
+		return fmt.Errorf("recover incidents: %w", err)
+	}
+
 	listener, err := net.Listen("tcp", *addr)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", *addr, err)
 	}
 
 	server := &http.Server{
-		Handler:           httpapi.NewHandler(timeline, log, log),
+		Handler:           httpapi.NewHandler(timeline, log, log, incidentStore),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	serverErr := make(chan error, 1)

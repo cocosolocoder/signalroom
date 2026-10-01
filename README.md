@@ -240,6 +240,80 @@ members, invalid filters or group-label names, a range needing more than
 group windows in total all return `400` with a non-empty `error` and never a
 partial result. A poisoned store returns `503`.
 
+### POST /incidents
+
+Create an incident. The body is a JSON object with exactly `id`, `title`,
+`service`, and `operator`; unknown or duplicate members are rejected. String
+fields are trimmed of surrounding whitespace, keep their case, and must be
+non-empty afterwards.
+
+`200` returns `{"id", "status", "version"}`; a new incident starts `open` at
+version `1`. Resubmitting the same normalized content returns the incident
+unchanged; a different content for the same id returns `409`.
+
+```bash
+curl -sS -X POST localhost:8080/incidents \
+  -H 'Content-Type: application/json' \
+  -d '{"id":"INC-1","title":"Error rate spike","service":"gateway","operator":"alice"}'
+```
+
+### POST /incidents/{id}/actions
+
+Apply one action to an incident. The body is a JSON object with exactly
+`action`, `action_id`, `operator`, and `expected_version`, plus the
+action-specific field:
+
+- `add_note` — `content` (the note text).
+- `link` — `event_id` (the already-ingested event to link).
+- `resolve` — `reason` (required).
+- `reopen` — `reason` (required).
+
+`action_id` is unique within the incident. `expected_version` is a positive
+integer; the action applies only when it equals the incident's current
+version. `open` incidents accept `add_note`, `link`, and `resolve`; `resolved`
+incidents accept only `reopen`.
+
+`200` returns `{"id", "action_id", "version"}` where `version` is the
+post-commit version (incremented by one). A version mismatch returns `409`
+with the current `current_version`. Resubmitting an `action_id` with the same
+normalized content (including operator and submitted version) returns the
+first success result without incrementing the version or appending history; a
+different content for the same `action_id` returns `409`.
+
+A linked event must exist (`404`), belong to the same service (`409`), and not
+already be linked to this incident (`409`); the same event may be linked to
+multiple incidents. Missing required fields, wrong types, and unknown actions
+return `400` without changing the incident.
+
+```bash
+curl -sS -X POST localhost:8080/incidents/INC-1/actions \
+  -H 'Content-Type: application/json' \
+  -d '{"action":"add_note","action_id":"ACT-1","operator":"bob","expected_version":1,"content":"investigating"}'
+```
+
+### GET /incidents/{id}
+
+Return the incident's full state: `id`, `title`, `service`, `status`,
+`version`, `links` (full event content in link order), and `history` (every
+recorded change in submission order). Each history entry carries `action`,
+`operator`, `content`, `version`, and `at`; action entries also carry
+`action_id`. Timestamps are UTC RFC3339Nano. The response is one consistent
+snapshot: state, links, and history all reflect the same version.
+
+```bash
+curl -sS localhost:8080/incidents/INC-1
+```
+
+Incident records are appended to `incidents.log` in the data directory with
+the same frame format and fsync guarantees as the event log, so confirmed
+creates and actions survive a restart or a process kill. Only an incomplete
+trailing write is discarded; any other corruption refuses startup without
+modifying the data. A write failure poisons the incident store: this and
+later incident requests return `503` until restart. A data directory without
+`incidents.log` (written by an older version) is accepted; the log is created
+on first write. Incident actions never modify events, and the alert preview
+never creates incidents.
+
 All error responses are JSON objects with a non-empty `error` string, e.g.
 `{"error":"event id already exists with different content"}`.
 

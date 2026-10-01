@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/cocosolocoder/signalroom/internal/events"
+	"github.com/cocosolocoder/signalroom/internal/incidents"
 )
 
 // maxBodyBytes bounds a single POST /events request.
@@ -25,23 +26,28 @@ type envelope struct {
 	Events json.RawMessage `json:"events"`
 }
 
-// Handler wires the timeline, its durable log, and the cursor store to HTTP
-// routes.
+// Handler wires the timeline, its durable log, the cursor store, and the
+// incident store to HTTP routes.
 type Handler struct {
-	timeline *events.Timeline
-	log      Storage
-	cursors  CursorStore
-	mux      *http.ServeMux
+	timeline  *events.Timeline
+	log       Storage
+	cursors   CursorStore
+	incidents *incidents.Store
+	mux       *http.ServeMux
 }
 
 // NewHandler builds the HTTP handler for a timeline backed by log. cursors
-// supplies the per-directory signing key and snapshot storage for paging.
-func NewHandler(timeline *events.Timeline, log Storage, cursors CursorStore) *Handler {
-	h := &Handler{timeline: timeline, log: log, cursors: cursors, mux: http.NewServeMux()}
+// supplies the per-directory signing key and snapshot storage for paging;
+// incidents supplies the incident store.
+func NewHandler(timeline *events.Timeline, log Storage, cursors CursorStore, incidents *incidents.Store) *Handler {
+	h := &Handler{timeline: timeline, log: log, cursors: cursors, incidents: incidents, mux: http.NewServeMux()}
 	h.mux.HandleFunc("/events", h.events)
 	h.mux.HandleFunc("/alerts/preview", h.previewAlerts)
 	h.mux.HandleFunc("/events/compare", h.compareEvents)
 	h.mux.HandleFunc("/events/page", h.pageEvents)
+	h.mux.HandleFunc("POST /incidents", h.createIncident)
+	h.mux.HandleFunc("POST /incidents/{id}/actions", h.incidentActions)
+	h.mux.HandleFunc("GET /incidents/{id}", h.getIncident)
 	h.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not found")
 	})

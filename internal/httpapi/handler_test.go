@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/cocosolocoder/signalroom/internal/events"
+	"github.com/cocosolocoder/signalroom/internal/incidents"
 )
 
 type fakeStorage struct {
@@ -74,7 +75,8 @@ func newTestServer(t *testing.T) (*httptest.Server, *fakeStorage, *events.Timeli
 	t.Helper()
 	tl := events.NewTimeline()
 	store := &fakeStorage{cursorKey: []byte("test-cursor-key-0123456789ab")}
-	server := httptest.NewServer(NewHandler(tl, store, store))
+	incidentStore := incidents.NewStore(nil, tl)
+	server := httptest.NewServer(NewHandler(tl, store, store, incidentStore))
 	t.Cleanup(server.Close)
 	return server, store, tl
 }
