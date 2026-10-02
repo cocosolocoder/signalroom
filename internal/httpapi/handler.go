@@ -11,6 +11,7 @@ import (
 
 	"github.com/cocosolocoder/signalroom/internal/events"
 	"github.com/cocosolocoder/signalroom/internal/incidents"
+	"github.com/cocosolocoder/signalroom/internal/metrics"
 )
 
 // maxBodyBytes bounds a single POST request body.
@@ -19,6 +20,12 @@ const maxBodyBytes = 16 << 20
 // Storage durably persists a batch before it becomes visible.
 type Storage interface {
 	Append(batch []events.Event) error
+	Poisoned() bool
+}
+
+// MetricsStorage durably persists a metric batch before it becomes visible.
+type MetricsStorage interface {
+	AppendBatch(batch []metrics.Sample) error
 	Poisoned() bool
 }
 
@@ -36,6 +43,9 @@ type Handler struct {
 	incidents    *incidents.Registry
 	incidentLogs IncidentStorage
 
+	metrics    *metrics.Timeline
+	metricLogs MetricsStorage
+
 	mux *http.ServeMux
 }
 
@@ -51,6 +61,15 @@ func WithIncidents(reg *incidents.Registry, store IncidentStorage) Option {
 	}
 }
 
+// WithMetrics enables the metric endpoints, backed by the metric timeline and
+// its durable store.
+func WithMetrics(timeline *metrics.Timeline, store MetricsStorage) Option {
+	return func(h *Handler) {
+		h.metrics = timeline
+		h.metricLogs = store
+	}
+}
+
 // NewHandler builds the HTTP handler for a timeline backed by log. cursors
 // supplies the per-directory signing key and snapshot storage for paging.
 func NewHandler(timeline *events.Timeline, log Storage, cursors CursorStore, opts ...Option) *Handler {
@@ -62,6 +81,10 @@ func NewHandler(timeline *events.Timeline, log Storage, cursors CursorStore, opt
 	h.mux.HandleFunc("/alerts/preview", h.previewAlerts)
 	h.mux.HandleFunc("/events/compare", h.compareEvents)
 	h.mux.HandleFunc("/events/page", h.pageEvents)
+	if h.metrics != nil {
+		h.mux.HandleFunc("/metrics", h.metricsRoot)
+		h.mux.HandleFunc("/metrics/aggregate", h.aggregateMetrics)
+	}
 	if h.incidents != nil {
 		h.mux.HandleFunc("/incidents", h.incidentsRoot)
 		h.mux.HandleFunc("/incidents/{id}", h.incidentItem)

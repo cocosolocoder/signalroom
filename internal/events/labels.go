@@ -138,6 +138,13 @@ func NormalizeLabelConditions(raw map[string]string) (map[string]string, error) 
 	return conditions, nil
 }
 
+// LabelsMatch reports whether a stored label set satisfies every condition.
+// An event missing a conditioned label never matches, and comparison is
+// case-sensitive on both names and values.
+func LabelsMatch(labels, conditions map[string]string) bool {
+	return labelsMatch(labels, conditions)
+}
+
 // labelsMatch reports whether a stored label set satisfies every condition.
 // An event missing a conditioned label never matches, and comparison is
 // case-sensitive on both names and values.

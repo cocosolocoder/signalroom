@@ -173,6 +173,85 @@ inverted or unequal-length windows, and the 10000-segment limit all return
 `400` with a non-empty `error`. As with the other endpoints, a poisoned store
 returns `503`.
 
+### POST /metrics
+
+Submit a batch of metric samples. The body must be a JSON object containing
+exactly a `samples` array. Each sample uses the fields `id`, `service`,
+`name`, `at`, and `value`, plus an optional `labels` object; `at` is an
+RFC3339Nano timestamp and `value` is a non-negative finite JSON number.
+Unknown or duplicate JSON fields are rejected with `400`.
+
+`id`, `service`, and `name` are trimmed of surrounding whitespace, keep their
+case, and must be non-empty afterwards. `labels` follows the same trimming
+and limit rules as events. The metric id space is independent of the event
+id space.
+
+A service, metric name, and the full label set determine one series. The
+whole batch is accepted or rejected together, with input validation taking
+precedence over conflict checks:
+
+- `200` — `{"created": <n>, "replayed": <m>}`, where `created` counts newly
+  stored samples and `replayed` counts retries identical to a stored sample.
+  Numeric spelling is irrelevant: `1` and `1.0` are the same content, and the
+  same instant in different timezones is identical.
+- `400` — invalid JSON, unknown or duplicate fields, an empty array, or a
+  sample failing validation. Nothing from the batch is written.
+- `409` — an id already stored with different content, an id repeated within
+  the batch, or the same series and timestamp presented under a different
+  id. Nothing is changed.
+- `503` — metric storage has failed; this and later metric requests fail
+  until restart. Event and incident endpoints are unaffected.
+
+```bash
+curl -sS -X POST localhost:8080/metrics \
+  -H 'Content-Type: application/json' \
+  -d '{"samples":[{"id":"m1","service":"gateway","name":"cpu","at":"2026-10-01T10:00:00Z","value":42.5,"labels":{"env":"prod"}}]}'
+```
+
+Re-sending the identical body returns `{"created":0,"replayed":1}`.
+
+### GET /metrics/aggregate
+
+Return cumulative-counter increments for the series matching the required
+`name` filter over a half-open window divided into aligned segments.
+
+- `name` — required, exact match (case-sensitive, no trimming).
+- `since`, `until` — required RFC3339Nano instants; `since` must be strictly
+  before `until`. The range is half-open: the start is included and the end
+  is excluded.
+- `step` — required decimal integer from `1` to `86400` seconds.
+- `service` — optional, exact match after trimming (same as `GET /events`).
+- `label` — optional and repeatable (up to 32), same `name=value` rules as
+  `GET /events`.
+
+Segments start at `since` and advance every `step` seconds; the final segment
+ends at `until` even when it is shorter than a full step. Only series with at
+least one matching sample in the window are returned. Each series lists its
+`service`, full `labels` (omitted when the series has none), and `segments`
+ordered from the window start. Every segment carries the UTC `since`/`until`
+boundaries, `count` of samples in the segment, and `increment`; empty segments
+are zero. A query with no matching series returns `[]`.
+
+For each series, adjacent samples in time order contribute their difference
+when the value did not decrease, or the current value when it did (a reset).
+A first sample with no predecessor contributes no increment; the latest
+sample before `since` can serve as the predecessor, so the first in-window
+sample still contributes, with its increment attributed to the segment
+containing that later sample. Late arrivals are re-bucketed by their own
+sample time, so an unchanged dataset always yields the same result. The whole
+response is computed from one committed snapshot.
+
+`200` returns the series array. Missing required parameters, duplicated
+parameters (except `label`), invalid values, a window needing more than 10000
+segments, or a result needing more than 100000 series-segments all return
+`400` with a non-empty `error`. If an increment sum cannot be represented as
+a finite number, the whole query returns `422`. A poisoned metric store
+returns `503`.
+
+```bash
+curl -sS 'localhost:8080/metrics/aggregate?name=cpu&since=2026-10-01T10:00:00Z&until=2026-10-01T11:00:00Z&step=60&service=gateway&label=env=prod'
+```
+
 ### POST /alerts/preview
 
 Preview when each service would cross an event-count threshold and recover

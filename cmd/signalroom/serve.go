@@ -16,6 +16,7 @@ import (
 	"github.com/cocosolocoder/signalroom/internal/httpapi"
 	"github.com/cocosolocoder/signalroom/internal/incidents"
 	"github.com/cocosolocoder/signalroom/internal/logfile"
+	"github.com/cocosolocoder/signalroom/internal/metrics"
 )
 
 func runServe(args []string) error {
@@ -61,6 +62,21 @@ func runServe(args []string) error {
 		}
 	}
 
+	// Metrics are replayed after incidents; they are independent of both.
+	metricLog, metricSamples, err := logfile.OpenMetricLog(*dataDir)
+	if err != nil {
+		return err
+	}
+	defer metricLog.Close()
+
+	metricTimeline := metrics.NewTimeline()
+	for _, sample := range metricSamples {
+		if err := metricTimeline.Load(sample); err != nil {
+			return fmt.Errorf("recover metrics: %w", err)
+		}
+	}
+	metricTimeline.SortAll()
+
 	listener, err := net.Listen("tcp", *addr)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", *addr, err)
@@ -68,7 +84,8 @@ func runServe(args []string) error {
 
 	server := &http.Server{
 		Handler: httpapi.NewHandler(timeline, log, log,
-			httpapi.WithIncidents(registry, incidentLog)),
+			httpapi.WithIncidents(registry, incidentLog),
+			httpapi.WithMetrics(metricTimeline, metricLog)),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	serverErr := make(chan error, 1)
