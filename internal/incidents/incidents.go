@@ -21,11 +21,14 @@ const (
 // Actions accepted by POST /incidents/{id}/actions. ActionCreate marks the
 // creation entry in an incident's history.
 const (
-	ActionCreate    = "create"
-	ActionNote      = "add_note"
-	ActionLinkEvent = "link_event"
-	ActionResolve   = "resolve"
-	ActionReopen    = "reopen"
+	ActionCreate            = "create"
+	ActionNote              = "add_note"
+	ActionLinkEvent         = "link_event"
+	ActionResolve           = "resolve"
+	ActionReopen            = "reopen"
+	ActionAddParticipant    = "add_participant"
+	ActionRemoveParticipant = "remove_participant"
+	ActionAssignOwner       = "assign_owner"
 )
 
 // ValidationError reports missing fields, wrong types, or unknown actions.
@@ -138,13 +141,15 @@ type Entry struct {
 
 // Incident is one committed snapshot, suitable for a single-version read.
 type Incident struct {
-	ID      string
-	Title   string
-	Service string
-	Status  string
-	Version int
-	Links   []string
-	History []Entry
+	ID           string
+	Title        string
+	Service      string
+	Status       string
+	Version      int
+	Participants []string
+	Owner        string
+	Links        []string
+	History      []Entry
 }
 
 // EventLookup resolves an event id without exposing the whole timeline, so
@@ -176,6 +181,15 @@ type incidentState struct {
 	service string
 	status  string
 	version int
+
+	// participants holds every participant name in membership order; the
+	// membership is tracked separately by participantSet. The owner is always
+	// among the participants. A newly created incident starts with only its
+	// operator as both participant and owner; note/link operators never join
+	// automatically.
+	participants   []string
+	participantSet map[string]struct{}
+	owner          string
 
 	links   []string
 	linkSet map[string]struct{}
@@ -257,7 +271,8 @@ func NormalizeRequest(input Request) (Request, error) {
 		return Request{}, validationErr("expected_version must be a positive integer")
 	}
 	switch input.Type {
-	case ActionNote, ActionLinkEvent, ActionResolve, ActionReopen:
+	case ActionNote, ActionLinkEvent, ActionResolve, ActionReopen,
+		ActionAddParticipant, ActionRemoveParticipant, ActionAssignOwner:
 	default:
 		return Request{}, validationErr("unknown action %q", input.Type)
 	}
@@ -275,6 +290,8 @@ func actionContentField(action string) string {
 		return "event_id"
 	case ActionResolve, ActionReopen:
 		return "reason"
+	case ActionAddParticipant, ActionRemoveParticipant, ActionAssignOwner:
+		return "participant"
 	default:
 		return "content"
 	}
@@ -402,12 +419,56 @@ func (r *Registry) checkAction(state *incidentState, req Request) error {
 		if state.status != StatusResolved {
 			return conflictErr(state.version, "incident %q is not resolved", state.id)
 		}
+	case ActionAddParticipant, ActionRemoveParticipant, ActionAssignOwner:
+		if state.status != StatusOpen {
+			return conflictErr(state.version, "cannot %s on a %s incident", participantRuleName(req.Type), state.status)
+		}
+		switch req.Type {
+		case ActionAddParticipant:
+			if _, member := state.participantSet[req.Content]; member {
+				return conflictErr(state.version,
+					"%q is already a participant of incident %q", req.Content, state.id)
+			}
+		case ActionRemoveParticipant:
+			if _, member := state.participantSet[req.Content]; !member {
+				return conflictErr(state.version,
+					"%q is not a participant of incident %q", req.Content, state.id)
+			}
+			if req.Content == state.owner {
+				return conflictErr(state.version,
+					"cannot remove the current owner %q from incident %q", req.Content, state.id)
+			}
+		case ActionAssignOwner:
+			if _, member := state.participantSet[req.Content]; !member {
+				return conflictErr(state.version,
+					"cannot hand incident %q to non-participant %q", state.id, req.Content)
+			}
+			if req.Content == state.owner {
+				return conflictErr(state.version,
+					"%q is already the owner of incident %q", req.Content, state.id)
+			}
+		}
 	}
 	return nil
 }
 
-// Get returns a point-in-time copy of one incident. The copy's status,
-// links, version, and history all belong to the same committed version.
+// participantRuleName renders the personnel action names in error messages.
+func participantRuleName(action string) string {
+	switch action {
+	case ActionAddParticipant:
+		return "add a participant"
+	case ActionRemoveParticipant:
+		return "remove a participant"
+	case ActionAssignOwner:
+		return "hand over ownership"
+	default:
+		return action
+	}
+}
+
+// Get returns a point-in-time copy of one incident. The copy's people,
+// status, links, version, and history all belong to the same committed
+// version.
 func (r *Registry) Get(id string) (Incident, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -420,16 +481,19 @@ func (r *Registry) Get(id string) (Incident, error) {
 
 func newIncidentState(creation Creation, at time.Time) *incidentState {
 	return &incidentState{
-		id:       creation.ID,
-		title:    creation.Title,
-		service:  creation.Service,
-		status:   StatusOpen,
-		version:  1,
-		links:    []string{},
-		linkSet:  make(map[string]struct{}),
-		actions:  make(map[string]committedAction),
-		history:  []Entry{{Operator: creation.Operator, Action: ActionCreate, Content: creation.Title, Version: 1, At: at}},
-		creation: creation,
+		id:             creation.ID,
+		title:          creation.Title,
+		service:        creation.Service,
+		status:         StatusOpen,
+		version:        1,
+		participants:   []string{creation.Operator},
+		participantSet: map[string]struct{}{creation.Operator: {}},
+		owner:          creation.Operator,
+		links:          []string{},
+		linkSet:        make(map[string]struct{}),
+		actions:        make(map[string]committedAction),
+		history:        []Entry{{Operator: creation.Operator, Action: ActionCreate, Content: creation.Title, Version: 1, At: at}},
+		creation:       creation,
 	}
 }
 
@@ -444,6 +508,14 @@ func (s *incidentState) commit(req Request, at time.Time) int {
 		s.status = StatusResolved
 	case ActionReopen:
 		s.status = StatusOpen
+	case ActionAddParticipant:
+		s.participantSet[req.Content] = struct{}{}
+		s.participants = append(s.participants, req.Content)
+	case ActionRemoveParticipant:
+		delete(s.participantSet, req.Content)
+		s.participants = removeString(s.participants, req.Content)
+	case ActionAssignOwner:
+		s.owner = req.Content
 	}
 	s.version++
 	s.history = append(s.history, Entry{
@@ -458,17 +530,31 @@ func (s *incidentState) commit(req Request, at time.Time) int {
 	return s.version
 }
 
+// removeString drops the first occurrence of value, preserving order.
+func removeString(values []string, value string) []string {
+	for i, v := range values {
+		if v == value {
+			return append(values[:i], values[i+1:]...)
+		}
+	}
+	return values
+}
+
 func (s *incidentState) snapshot() Incident {
 	links := slices.Clone(s.links)
 	history := make([]Entry, len(s.history))
 	copy(history, s.history)
+	participants := append([]string{}, s.participants...)
+	slices.Sort(participants)
 	return Incident{
-		ID:      s.id,
-		Title:   s.title,
-		Service: s.service,
-		Status:  s.status,
-		Version: s.version,
-		Links:   links,
-		History: history,
+		ID:           s.id,
+		Title:        s.title,
+		Service:      s.service,
+		Status:       s.status,
+		Version:      s.version,
+		Participants: participants,
+		Owner:        s.owner,
+		Links:        links,
+		History:      history,
 	}
 }

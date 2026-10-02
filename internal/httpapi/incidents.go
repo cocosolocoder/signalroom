@@ -32,6 +32,7 @@ var (
 		"content":          {},
 		"event_id":         {},
 		"reason":           {},
+		"participant":      {},
 	}
 )
 
@@ -173,7 +174,7 @@ func decodeActionRequest(w http.ResponseWriter, incidentID string, fields map[st
 	if !ok {
 		return incidents.Request{}, false
 	}
-	for _, extra := range []string{"content", "event_id", "reason"} {
+	for _, extra := range []string{"content", "event_id", "reason", "participant"} {
 		if extra == payloadField {
 			continue
 		}
@@ -202,6 +203,8 @@ func actionPayloadField(action string) (string, bool) {
 		return "event_id", true
 	case incidents.ActionResolve, incidents.ActionReopen:
 		return "reason", true
+	case incidents.ActionAddParticipant, incidents.ActionRemoveParticipant, incidents.ActionAssignOwner:
+		return "participant", true
 	default:
 		return "", false
 	}
@@ -304,13 +307,15 @@ type historyEntryDTO struct {
 }
 
 type incidentResponse struct {
-	ID      string            `json:"id"`
-	Title   string            `json:"title"`
-	Service string            `json:"service"`
-	Status  string            `json:"status"`
-	Version int               `json:"version"`
-	Events  []eventDTO        `json:"events"`
-	History []historyEntryDTO `json:"history"`
+	ID           string            `json:"id"`
+	Title        string            `json:"title"`
+	Service      string            `json:"service"`
+	Status       string            `json:"status"`
+	Version      int               `json:"version"`
+	Participants []string          `json:"participants"`
+	Owner        string            `json:"owner"`
+	Events       []eventDTO        `json:"events"`
+	History      []historyEntryDTO `json:"history"`
 }
 
 // writeIncident serializes one committed incident snapshot. Linked events
@@ -335,13 +340,20 @@ func writeIncident(w http.ResponseWriter, h *Handler, inc incidents.Incident) {
 		}
 	}
 
+	participants := inc.Participants
+	if participants == nil {
+		participants = []string{}
+	}
+
 	writeJSON(w, http.StatusOK, incidentResponse{
-		ID:      inc.ID,
-		Title:   inc.Title,
-		Service: inc.Service,
-		Status:  inc.Status,
-		Version: inc.Version,
-		Events:  eventDTOs,
-		History: history,
+		ID:           inc.ID,
+		Title:        inc.Title,
+		Service:      inc.Service,
+		Status:       inc.Status,
+		Version:      inc.Version,
+		Participants: participants,
+		Owner:        inc.Owner,
+		Events:       eventDTOs,
+		History:      history,
 	})
 }

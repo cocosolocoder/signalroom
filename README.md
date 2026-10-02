@@ -252,6 +252,10 @@ version `1`. Re-sending the same `id` with the same content after
 normalization replays the first result (`open`, version `1`), even after the
 incident has evolved; the same `id` with different content is `409`.
 
+The `operator` also becomes the incident's sole participant and its owner.
+No extra request fields are required; this default is derived from the
+creation and is never stored as a separate version or history entry.
+
 ```bash
 curl -sS -X POST localhost:8080/incidents \
   -H 'Content-Type: application/json' \
@@ -271,9 +275,23 @@ incident. Actions are:
   event may be linked to several incidents. Linking never modifies the event.
 - `resolve` with a non-empty `reason`.
 - `reopen` with a non-empty `reason`.
+- `add_participant` with `participant`: joins a person to the incident.
+- `remove_participant` with `participant`: removes a person. The current
+  owner cannot be removed.
+- `assign_owner` with `participant`: hands ownership to an existing
+  participant.
 
-While `open`, notes, links, and resolve are accepted. While `resolved`, only
-reopen is; anything else is `409`.
+Every `participant` value is trimmed of surrounding whitespace, keeps its
+interior case, and must be non-empty afterwards; names differing only in
+case are different people. While `open`, notes, links, resolve, and the
+three personnel actions are accepted. While `resolved`, only reopen is;
+anything else is `409` (including personnel changes). Duplicate joins,
+removing someone who is not a participant, removing the current owner,
+handing ownership to a non-participant or to the current owner, and any new
+action against a resolved incident are `409` carrying the current version.
+Resolving and reopening never changes the participants or owner. The
+operator of a note or any other action is not added as a participant and is
+not rejected for being outside the participant list.
 
 `expected_version` is optimistic concurrency: it must equal the incident's
 current committed version. Two different actions submitted at the same
@@ -285,20 +303,25 @@ version cannot both succeed; the loser gets `409` with the current version:
 
 On success `200` returns `{"incident_id","action_id","version"}`, where
 `version` is the incident's version after the action (the previous version
-plus one). Status, links, and history all advance together.
+plus one). Status, people, links, and history all advance together; a
+personnel action adds a history entry whose `content` is the normalized
+target name.
 
 A request is idempotent on `(incident id, action id)`. Re-submitting a
 successful action with the same normalized content — operator and submitted
 `expected_version` included — returns the first result and adds no history or
-version, even though that expected version is now stale; concurrent identical
-submissions produce exactly one record. The same `action_id` with different
-content is `409`.
+version, even though that expected version is now stale and even if the
+incident has since been handed over, resolved, or the target person removed;
+it never restores an older people state. Concurrent identical submissions
+produce exactly one record. The same `action_id` with different content is
+`409`.
 
-Status codes: `400` for a missing field, wrong type, or unknown action;
-`404` when the incident (or, for a link, the event) does not exist; `409`
-for a stale version, a state-machine violation, a cross-service or duplicate
-link, or replayed-but-changed content. A rejected request never changes the
-incident.
+Status codes: `400` for a missing field, wrong type, unknown action,
+unknown/extra payload field, or a body carrying more than one action
+payload; `404` when the incident (or, for a link, the event) does not exist;
+`409` for a stale version, a state-machine violation, a cross-service or
+duplicate link, a rejected personnel change, or replayed-but-changed
+content. A rejected request never changes the incident.
 
 ### GET /incidents/{id}
 
@@ -311,6 +334,8 @@ Return one incident:
   "service": "checkout",
   "status": "resolved",
   "version": 4,
+  "participants": ["alice", "bob"],
+  "owner": "bob",
   "events": [ { "id": "evt-1", "...": "full stored event content" } ],
   "history": [
     {"operator":"alice","action":"create","content":"Checkout outage","version":1,"at":"2026-10-02T08:00:00.123456789Z"},
@@ -321,13 +346,20 @@ Return one incident:
 }
 ```
 
+`participants` lists the participant names with duplicates removed and
+sorted lexicographically by name (case kept); an empty list never occurs
+because the owner is always a participant. `owner` is the current owner's
+name. The creator is the initial sole participant and owner.
+
 `events` lists every linked event with its full stored content in link order;
 an empty list is `[]`. `history` covers the creation and every successful
 action in commit order. The creation entry records the operator, action
 `create`, the title as its `content`, version `1`, and the server time, and
-has no `action_id`; later entries also carry their `action_id`. Every `at` is
-UTC RFC3339Nano. The whole response is one committed snapshot, so its status
-and history always belong to the same version. An unknown id is `404`.
+has no `action_id`; later entries also carry their `action_id`. Personnel
+actions appear like any other entry, with `content` set to the normalized
+target name. Every `at` is UTC RFC3339Nano. The whole response is one
+committed snapshot, so its people, status, version, and history always
+belong to the same committed state. An unknown id is `404`.
 
 Incidents are stored in their own append-only `incidents.log` in the same
 data directory, under the same durability and recovery rules as
@@ -336,8 +368,15 @@ kill, only an incomplete trailing record is discarded, and any other
 corruption prevents startup without touching the existing data. A failed
 incident write returns `503` and every later incident request in that process
 returns `503` until restart; event endpoints are unaffected, and vice versa.
+Personnel changes are ordinary action records, so they share the incident
+version and the same fsync/503 semantics: a failed write leaves people,
+version, and history exactly where they were.
 Old data directories without `incidents.log` work unchanged, and
-`POST /alerts/preview` never creates incidents.
+`POST /alerts/preview` never creates incidents. Logs written by an older
+version read unchanged: the creator becomes each incident's initial
+participant and owner in memory, and saved actions replay on top, without
+adding versions or history, rewriting records, or promoting historical note
+operators into participants.
 
 All error responses are JSON objects with a non-empty `error` string, e.g.
 `{"error":"event id already exists with different content"}`.

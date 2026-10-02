@@ -84,6 +84,33 @@ func (r *Registry) checkLoadedAction(state *incidentState, req Request) error {
 		if state.status != StatusResolved {
 			return validationErr("reopen action %q on non-resolved incident in log", req.ActionID)
 		}
+	case ActionAddParticipant:
+		if state.status != StatusOpen {
+			return validationErr("add_participant action %q on %s incident in log", req.ActionID, state.status)
+		}
+		if _, member := state.participantSet[req.Content]; member {
+			return validationErr("participant %q added twice in incident %q log", req.Content, state.id)
+		}
+	case ActionRemoveParticipant:
+		if state.status != StatusOpen {
+			return validationErr("remove_participant action %q on %s incident in log", req.ActionID, state.status)
+		}
+		if _, member := state.participantSet[req.Content]; !member {
+			return validationErr("participant %q removed without joining in incident %q log", req.Content, state.id)
+		}
+		if req.Content == state.owner {
+			return validationErr("current owner %q removed in incident %q log", req.Content, state.id)
+		}
+	case ActionAssignOwner:
+		if state.status != StatusOpen {
+			return validationErr("assign_owner action %q on %s incident in log", req.ActionID, state.status)
+		}
+		if _, member := state.participantSet[req.Content]; !member {
+			return validationErr("incident %q handed to non-participant %q in log", state.id, req.Content)
+		}
+		if req.Content == state.owner {
+			return validationErr("owner %q handed over to itself in incident %q log", req.Content, state.id)
+		}
 	default:
 		return validationErr("unknown action %q in log", req.Type)
 	}
