@@ -240,6 +240,93 @@ members, invalid filters or group-label names, a range needing more than
 group windows in total all return `400` with a non-empty `error` and never a
 partial result. A poisoned store returns `503`.
 
+### POST /metrics
+
+Submit a batch of cumulative counter samples. The body must be a JSON object
+containing exactly a non-empty `samples` array; each sample has `id`,
+`service`, `name`, `at`, `value`, and an optional `labels` object. Metric ids
+are independent of event ids. `id`, `service`, and `name` are trimmed of
+surrounding whitespace, keep their case, and must be non-empty afterwards.
+`at` is an RFC3339Nano timestamp and `value` must be a non-negative, finite
+JSON number. `labels` follows the exact ingestion rules and limits of event
+labels. Unknown and duplicate JSON fields (at the body, sample, or label
+level) are rejected with `400`.
+
+The whole batch is accepted or rejected together, with input validation
+taking precedence over conflict checks:
+
+- `200` — `{"created": <n>, "replayed": <m>}`, where `created` counts newly
+  stored samples and `replayed` counts retries identical to a stored sample.
+  Numeric values compare numerically (`1` and `1.0` are the same) and time
+  equality uses absolute instants (equivalent timezones are the same); label
+  order and surrounding whitespace are irrelevant.
+- `400` — invalid JSON, unknown/duplicate fields, an empty array, or a sample
+  failing validation. Nothing from the batch is written.
+- `409` — an id already stored with different normalized content, an id
+  repeated within the batch, or two different ids claiming the same series at
+  the same instant. A series is identified by the service, metric name, and
+  the complete label set. Nothing is changed.
+- `503` — metric storage has failed; this and later metric requests fail until
+  restart. Event and incident endpoints are unaffected.
+
+Concurrent submissions still commit as whole batches, and an identical retry
+is stored at most once.
+
+```bash
+curl -sS -X POST localhost:8080/metrics \
+  -H 'Content-Type: application/json' \
+  -d '{"samples":[{"id":"s1","service":"gateway","name":"http_requests","at":"2026-10-01T10:00:00Z","value":100,"labels":{"env":"prod"}}]}'
+```
+
+### GET /metrics/aggregate
+
+Report, per matching series, how much a cumulative counter increased during
+each segment of a window. Required query parameters are `name` (exact,
+case-sensitive match), `since` and `until` (RFC3339Nano, with `since` strictly
+before `until`), and `step` (a decimal integer from `1` to `86400` seconds).
+Optional `service` (exact match after trimming) and repeatable `label`
+conditions use the same rules as `GET /events`; `label` may repeat, but every
+other parameter appearing more than once is `400`.
+
+The window is half-open (`[since, until)`; a sample exactly at `until` never
+participates) and is divided from `since` into segments of `step` seconds,
+the final segment keeping the remaining time. A request needing more than
+10000 segments, or whose answer would contain more than 100000 series-segment
+pairs, is rejected with `400` rather than truncated. Missing required
+parameters, invalid values, and bad label conditions are also `400`.
+
+For each series, adjacent samples in time are compared: when the value does
+not move backwards the segment delta is the difference; a backwards reading is
+treated as a counter reset and contributes the current value. The first
+sample overall has no predecessor and contributes no delta, but the nearest
+sample strictly before `since` acts as the predecessor for the first in-window
+sample. Every delta is attributed to the segment containing the later
+sample. Late-arriving data is re-bucketed by its own sample time, so the same
+dataset always yields the same values and ordering regardless of ingestion
+order; each query reads one committed snapshot.
+
+Only series with at least one matching sample inside the window are returned
+as a JSON array; a window with no matches is `[]`. Each series lists its
+`service`, the full stored `labels` (omitted when the series has none), and
+its segments in time order; every segment carries the UTC `since`/`until`
+boundaries, the sample `count`, and the `delta` (zero for empty segments).
+
+```bash
+curl -sS 'localhost:8080/metrics/aggregate?name=http_requests&service=gateway&label=env=prod&since=2026-10-01T10:00:00Z&until=2026-10-01T11:00:00Z&step=60'
+```
+
+If the increments within the query cannot be summed into a finite number, the
+whole query returns `422` instead of an infinite or NaN total. As with the
+other endpoints, a poisoned metric store returns `503`.
+
+Accepted metric batches are fsynced in their own `metrics.log` before the
+success response, under the same durability and recovery rules as
+`events.log` and `incidents.log`: confirmed samples survive a restart or a
+kill, only an incomplete trailing batch is discarded, and any other
+corruption prevents startup without modifying the data. A failed metric write
+poisons only metric handling; events and incidents keep working. Old data
+directories without `metrics.log` start unchanged.
+
 ### POST /incidents
 
 Open an incident. The body is a JSON object with exactly the members `id`,

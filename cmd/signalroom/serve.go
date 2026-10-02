@@ -16,6 +16,7 @@ import (
 	"github.com/cocosolocoder/signalroom/internal/httpapi"
 	"github.com/cocosolocoder/signalroom/internal/incidents"
 	"github.com/cocosolocoder/signalroom/internal/logfile"
+	"github.com/cocosolocoder/signalroom/internal/metrics"
 )
 
 func runServe(args []string) error {
@@ -61,6 +62,23 @@ func runServe(args []string) error {
 		}
 	}
 
+	// Metric samples live in their own log and recover independently of
+	// events and incidents.
+	metricLog, metricBatches, err := logfile.OpenMetricsLog(*dataDir)
+	if err != nil {
+		return err
+	}
+	defer metricLog.Close()
+
+	metricStore := metrics.NewStore()
+	for _, batch := range metricBatches {
+		for _, sample := range batch {
+			if err := metricStore.Load(sample); err != nil {
+				return fmt.Errorf("recover metrics: %w", err)
+			}
+		}
+	}
+
 	listener, err := net.Listen("tcp", *addr)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", *addr, err)
@@ -68,7 +86,8 @@ func runServe(args []string) error {
 
 	server := &http.Server{
 		Handler: httpapi.NewHandler(timeline, log, log,
-			httpapi.WithIncidents(registry, incidentLog)),
+			httpapi.WithIncidents(registry, incidentLog),
+			httpapi.WithMetrics(metricStore, metricLog)),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	serverErr := make(chan error, 1)
