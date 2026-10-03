@@ -19,11 +19,42 @@ type fakeStorage struct {
 	poisoned bool
 	appended []int
 
+	// stall, when non-nil, blocks one Append (with the timeline write lock
+	// held) until the channel is closed; stallEntered is closed once that
+	// Append reaches the wait. armStall sets both up.
+	stall        chan struct{}
+	stallEntered chan struct{}
+
 	cursorKey []byte
 	snapshots map[string][]byte
 }
 
+// armStall makes the next Append block until the returned release channel is
+// closed. The returned entered channel closes once that Append is waiting, so
+// a test knows the batch is held mid commit.
+func (f *fakeStorage) armStall() (release, entered chan struct{}) {
+	release = make(chan struct{})
+	entered = make(chan struct{})
+	f.mu.Lock()
+	f.stall = release
+	f.stallEntered = entered
+	f.mu.Unlock()
+	return release, entered
+}
+
 func (f *fakeStorage) Append(batch []events.Event) error {
+	f.mu.Lock()
+	stall := f.stall
+	entered := f.stallEntered
+	f.stall = nil
+	f.stallEntered = nil
+	f.mu.Unlock()
+	if stall != nil {
+		// Only the first Append blocks: the stalled submission still holds
+		// the timeline lock, so no other Append can reach here concurrently.
+		close(entered)
+		<-stall
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.poisoned {
