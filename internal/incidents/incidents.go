@@ -420,40 +420,135 @@ func (r *Registry) checkAction(state *incidentState, req Request) error {
 			return conflictErr(state.version, "incident %q is not resolved", state.id)
 		}
 	case ActionAddParticipant, ActionRemoveParticipant, ActionAssignOwner:
-		if state.status != StatusOpen {
-			return conflictErr(state.version, "cannot %s on a %s incident", participantRuleName(req.Type), state.status)
-		}
-		switch req.Type {
-		case ActionAddParticipant:
-			if _, member := state.participantSet[req.Content]; member {
-				return conflictErr(state.version,
-					"%q is already a participant of incident %q", req.Content, state.id)
-			}
-		case ActionRemoveParticipant:
-			if _, member := state.participantSet[req.Content]; !member {
-				return conflictErr(state.version,
-					"%q is not a participant of incident %q", req.Content, state.id)
-			}
-			if req.Content == state.owner {
-				return conflictErr(state.version,
-					"cannot remove the current owner %q from incident %q", req.Content, state.id)
-			}
-		case ActionAssignOwner:
-			if _, member := state.participantSet[req.Content]; !member {
-				return conflictErr(state.version,
-					"cannot hand incident %q to non-participant %q", state.id, req.Content)
-			}
-			if req.Content == state.owner {
-				return conflictErr(state.version,
-					"%q is already the owner of incident %q", req.Content, state.id)
-			}
+		// The personnel constraints are owned by checkPersonnelAction so the
+		// live path and startup replay enforce exactly the same rules.
+		if perr := checkPersonnelAction(state, req); perr != nil {
+			return conflictErr(state.version, "%s", perr.LiveError())
 		}
 	}
 	return nil
 }
 
-// participantRuleName renders the personnel action names in error messages.
-func participantRuleName(action string) string {
+// personnelRule identifies one violated personnel constraint.
+type personnelRule int
+
+const (
+	// Personnel actions are only accepted while the incident is open.
+	personnelRuleNotOpen personnelRule = iota
+	// add_participant: the target is already a participant.
+	personnelRuleAlreadyMember
+	// remove_participant: the target is not a participant.
+	personnelRuleNotMember
+	// remove_participant: the target is the current owner.
+	personnelRuleRemoveOwner
+	// assign_owner: the target is not a participant.
+	personnelRuleAssignOutsider
+	// assign_owner: the target is already the owner.
+	personnelRuleAssignCurrentOwner
+)
+
+// personnelError describes one violated personnel rule with enough context to
+// render it either as a live 409 conflict (LiveError) or as corruption found
+// while replaying the durable log (LogError). Keeping both wordings next to
+// the single rule list is what lets online submission and startup replay
+// share one constraint definition.
+type personnelError struct {
+	rule       personnelRule
+	action     string
+	actionID   string
+	target     string
+	incidentID string
+	status     string
+}
+
+func (e *personnelError) Error() string { return e.LiveError() }
+
+// LiveError renders the violation as returned for an online request.
+func (e *personnelError) LiveError() string {
+	switch e.rule {
+	case personnelRuleNotOpen:
+		return fmt.Sprintf("cannot %s on a %s incident", personnelActionPhrase(e.action), e.status)
+	case personnelRuleAlreadyMember:
+		return fmt.Sprintf("%q is already a participant of incident %q", e.target, e.incidentID)
+	case personnelRuleNotMember:
+		return fmt.Sprintf("%q is not a participant of incident %q", e.target, e.incidentID)
+	case personnelRuleRemoveOwner:
+		return fmt.Sprintf("cannot remove the current owner %q from incident %q", e.target, e.incidentID)
+	case personnelRuleAssignOutsider:
+		return fmt.Sprintf("cannot hand incident %q to non-participant %q", e.incidentID, e.target)
+	case personnelRuleAssignCurrentOwner:
+		return fmt.Sprintf("%q is already the owner of incident %q", e.target, e.incidentID)
+	default:
+		return e.action
+	}
+}
+
+// LogError renders the same violation as an inconsistency in the durable log.
+func (e *personnelError) LogError() string {
+	switch e.rule {
+	case personnelRuleNotOpen:
+		return fmt.Sprintf("%s action %q on %s incident in log", e.action, e.actionID, e.status)
+	case personnelRuleAlreadyMember:
+		return fmt.Sprintf("participant %q added twice in incident %q log", e.target, e.incidentID)
+	case personnelRuleNotMember:
+		return fmt.Sprintf("participant %q removed without joining in incident %q log", e.target, e.incidentID)
+	case personnelRuleRemoveOwner:
+		return fmt.Sprintf("current owner %q removed in incident %q log", e.target, e.incidentID)
+	case personnelRuleAssignOutsider:
+		return fmt.Sprintf("incident %q handed to non-participant %q in log", e.incidentID, e.target)
+	case personnelRuleAssignCurrentOwner:
+		return fmt.Sprintf("owner %q handed over to itself in incident %q log", e.target, e.incidentID)
+	default:
+		return e.action
+	}
+}
+
+// checkPersonnelAction enforces the single set of business rules shared by
+// online submission and startup replay: personnel actions only apply while
+// the incident is open; an added person must not already participate; a
+// removed person must participate and must not be the current owner; an owner
+// handover must target a participant other than the current owner. Names are
+// case-sensitive. It returns nil when the action satisfies every rule.
+func checkPersonnelAction(state *incidentState, req Request) *personnelError {
+	fail := func(rule personnelRule) *personnelError {
+		return &personnelError{
+			rule:       rule,
+			action:     req.Type,
+			actionID:   req.ActionID,
+			target:     req.Content,
+			incidentID: state.id,
+			status:     state.status,
+		}
+	}
+	if state.status != StatusOpen {
+		return fail(personnelRuleNotOpen)
+	}
+	_, member := state.participantSet[req.Content]
+	switch req.Type {
+	case ActionAddParticipant:
+		if member {
+			return fail(personnelRuleAlreadyMember)
+		}
+	case ActionRemoveParticipant:
+		if !member {
+			return fail(personnelRuleNotMember)
+		}
+		if req.Content == state.owner {
+			return fail(personnelRuleRemoveOwner)
+		}
+	case ActionAssignOwner:
+		if !member {
+			return fail(personnelRuleAssignOutsider)
+		}
+		if req.Content == state.owner {
+			return fail(personnelRuleAssignCurrentOwner)
+		}
+	}
+	return nil
+}
+
+// personnelActionPhrase renders the personnel action names in status messages.
+func personnelActionPhrase(action string) string {
 	switch action {
 	case ActionAddParticipant:
 		return "add a participant"
