@@ -34,7 +34,11 @@ fail with a non-zero status without modifying the data.
 Submit a batch. The body must be a JSON object containing exactly an `events`
 array. Each event uses the fields `id`, `service`, `severity`, `message` and
 `at`, plus an optional `labels` object; `at` is an RFC3339Nano timestamp.
-Unknown fields are rejected. String fields are trimmed and `severity` is
+Unknown fields are rejected, and a field name may not appear twice within the
+same object — this applies to the request body, each event, and a `labels`
+object, even when the two values are identical or the first is `null`; names
+are compared after JSON decoding, so a literal name and its `\uXXXX` escape
+of the same text also repeat. String fields are trimmed and `severity` is
 lowercased; `id`, `service`, `message` and `at` are required.
 
 `labels` is a JSON object of string to string (for example
@@ -54,8 +58,8 @@ taking precedence over conflict checks:
 
 - `200` — `{"created": <n>, "replayed": <m>}`, where `created` counts newly
   stored events and `replayed` counts retries identical to a stored event.
-- `400` — invalid JSON, unknown fields, an empty array, or an event failing
-  validation. Nothing from the batch is written.
+- `400` — invalid JSON, unknown or duplicate fields, an empty array, or an
+  event failing validation. Nothing from the batch is written.
 - `409` — an id already stored with different content, or an id repeated
   within the batch. Nothing is changed.
 - `503` — storage has failed; this and later requests fail until restart.

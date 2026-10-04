@@ -86,6 +86,41 @@ func TestMarshalBatchLabelsRoundTrip(t *testing.T) {
 	}
 }
 
+func TestDecodeBatchRejectsDuplicateEventFields(t *testing.T) {
+	at := `"at":"2026-10-01T09:00:00Z"`
+	cases := map[string]string{
+		"duplicate id same value":         `[{"id":"e1","id":"e1","service":"s","severity":"info","message":"m",` + at + `}]`,
+		"duplicate id differing":          `[{"id":"e1","id":"e2","service":"s","severity":"info","message":"m",` + at + `}]`,
+		"duplicate at":                    `[{"id":"e1","service":"s","severity":"info","message":"m",` + at + `,` + at + `}]`,
+		"bad labels then good labels":     `[{"id":"e1","service":"s","severity":"info","message":"m",` + at + `,"labels":{"env":1},"labels":{"env":"prod"}}]`,
+		"null then real labels":           `[{"id":"e1","service":"s","severity":"info","message":"m",` + at + `,"labels":null,"labels":{"env":"prod"}}]`,
+		"unicode escape duplicates lit":   `[{"id":"e1","service":"s","severity":"info","message":"m",` + at + `,"labels":{"\u0065nv":"a","env":"b"}}]`,
+		"unicode escaped field repeats":   `[{"id":"e1","\u0069\u0064":"e2","service":"s","severity":"info","message":"m",` + at + `}]`,
+		"second duplicate in later event": `[{"id":"e1","service":"s","severity":"info","message":"m",` + at + `},{"id":"e2","id":"e3","service":"s","severity":"info","message":"m",` + at + `}]`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := DecodeBatch([]byte(body)); err == nil {
+				t.Fatal("want decode error for duplicate field")
+			}
+		})
+	}
+}
+
+func TestDecodeBatchSameFieldInDifferentEventsIsFine(t *testing.T) {
+	body := `[
+		{"id":"e1","service":"s","severity":"info","message":"m","at":"2026-10-01T09:00:00Z","labels":{"env":"prod"}},
+		{"id":"e2","service":"s","severity":"info","message":"m","at":"2026-10-01T09:01:00Z","labels":{"env":"canary"}}
+	]`
+	batch, err := DecodeBatch([]byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(batch) != 2 || batch[0].Labels["env"] != "prod" || batch[1].Labels["env"] != "canary" {
+		t.Fatalf("independent objects must not share duplicate detection: %+v", batch)
+	}
+}
+
 func TestDecodeBatchLegacyFrameWithoutLabels(t *testing.T) {
 	// Frames written before labels existed have no labels member and must
 	// still decode as label-less events.

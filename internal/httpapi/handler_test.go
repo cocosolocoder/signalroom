@@ -265,6 +265,77 @@ func TestPostValidationPrecedesConflict(t *testing.T) {
 	}
 }
 
+func TestPostRejectsDuplicateJSONFields(t *testing.T) {
+	server, store, _ := newTestServer(t)
+	const at = `"at":"2026-10-01T09:00:00Z"`
+	cases := map[string]string{
+		"duplicate top events":        `{"events":[],"events":[{"id":"a","service":"s","severity":"info","message":"m",` + at + `}]}`,
+		"duplicate event id":          `{"events":[{"id":"a","id":"a","service":"s","severity":"info","message":"m",` + at + `}]}`,
+		"duplicate null then id":      `{"events":[{"id":null,"id":"a","service":"s","severity":"info","message":"m",` + at + `}]}`,
+		"duplicate service":           `{"events":[{"id":"a","service":"s1","service":"s2","severity":"info","message":"m",` + at + `}]}`,
+		"bad labels then good labels": `{"events":[{"id":"a","service":"s","severity":"info","message":"m",` + at + `,"labels":{"env":1},"labels":{"env":"prod"}}]}`,
+		"null then real labels":       `{"events":[{"id":"a","service":"s","severity":"info","message":"m",` + at + `,"labels":null,"labels":{"env":"prod"}}]}`,
+		"unicode field escape":        `{"events":[{"id":"a","\u0069\u0064":"a","service":"s","severity":"info","message":"m",` + at + `}]}`,
+		"unicode label escape":        `{"events":[{"id":"a","service":"s","severity":"info","message":"m",` + at + `,"labels":{"\u0065nv":"a","env":"b"}}]}`,
+		"dup field in later event": `{"events":[
+			{"id":"a","service":"s","severity":"info","message":"m",` + at + `},
+			{"id":"b","id":"c","service":"s","severity":"info","message":"m",` + at + `}
+		]}`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			status, out := post(t, server, body)
+			if status != http.StatusBadRequest {
+				t.Fatalf("want 400, got %d (%v)", status, out)
+			}
+			if msg, _ := out["error"].(string); msg == "" {
+				t.Fatal("error response needs a non-empty error string")
+			}
+		})
+	}
+	if len(store.appended) != 0 {
+		t.Fatalf("ambiguous requests must not persist anything: %v", store.appended)
+	}
+	if status, rows := get(t, server, ""); status != http.StatusOK || len(rows.([]any)) != 0 {
+		t.Fatalf("rejected events must not be queryable: %d %v", status, rows)
+	}
+
+	// A rejected input is not a storage failure: a well-formed batch after
+	// it goes through normally, including its created/replayed counts.
+	good := `{"events":[{"id":"g1","service":"s","severity":" INFO ","message":" hi ","at":"2026-10-01T09:00:00Z"}]}`
+	if status, out := post(t, server, good); status != http.StatusOK || out["created"].(float64) != 1 || out["replayed"].(float64) != 0 {
+		t.Fatalf("valid batch after rejected ones must succeed: %d %v", status, out)
+	}
+	if status, out := post(t, server, good); status != http.StatusOK || out["created"].(float64) != 0 || out["replayed"].(float64) != 1 {
+		t.Fatalf("retry counts changed: %d %v", status, out)
+	}
+	status, rows := get(t, server, "")
+	arr := rows.([]any)
+	if status != http.StatusOK || len(arr) != 1 {
+		t.Fatalf("only the valid event should be stored: %d %v", status, rows)
+	}
+	only := arr[0].(map[string]any)
+	if only["id"] != "g1" || only["severity"] != "info" || only["message"] != "hi" {
+		t.Fatalf("normalization changed: %v", only)
+	}
+}
+
+func TestPostDuplicateFieldPrecedesConflict(t *testing.T) {
+	server, store, _ := newTestServer(t)
+	seed := `{"events":[{"id":"dup","service":"s","severity":"info","message":"v1","at":"2026-10-01T09:00:00Z"}]}`
+	if status, out := post(t, server, seed); status != http.StatusOK {
+		t.Fatalf("seed: %d %v", status, out)
+	}
+	// Both a 409 id conflict and a duplicated field: invalid input wins.
+	mixed := `{"events":[{"id":"dup","service":"s","severity":"info","message":"v2","at":"2026-10-01T09:00:00Z","at":"2026-10-01T09:00:00Z"}]}`
+	if status, out := post(t, server, mixed); status != http.StatusBadRequest {
+		t.Fatalf("want 400 before 409, got %d %v", status, out)
+	}
+	if len(store.appended) != 1 {
+		t.Fatalf("rejected batch must not persist: %v", store.appended)
+	}
+}
+
 func TestGetFiltersRangesAndEmpty(t *testing.T) {
 	server, _, _ := newTestServer(t)
 	body := `{"events":[

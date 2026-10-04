@@ -76,15 +76,15 @@ func DecodeLabelsObject(raw json.RawMessage) (map[string]string, error) {
 	return labels, nil
 }
 
-// rawEventDTO mirrors eventDTO but keeps labels unexamined so DecodeBatch can
-// apply the strict duplicate-key and string-value checks.
-type rawEventDTO struct {
-	ID       string          `json:"id"`
-	Service  string          `json:"service"`
-	Severity string          `json:"severity"`
-	Message  string          `json:"message"`
-	At       time.Time       `json:"at"`
-	Labels   json.RawMessage `json:"labels"`
+// allowedEventFields is the exact set of members each event object may
+// carry; anything else is an unknown field.
+var allowedEventFields = map[string]struct{}{
+	"id":       {},
+	"service":  {},
+	"severity": {},
+	"message":  {},
+	"at":       {},
+	"labels":   {},
 }
 
 // MarshalBatch encodes normalized events as a JSON array with sorted keys.
@@ -103,14 +103,32 @@ func MarshalBatch(batch []Event) ([]byte, error) {
 	return json.Marshal(dtos)
 }
 
-// DecodeBatch strictly decodes a JSON array of events. Unknown fields, syntax
-// errors, malformed timestamps, malformed labels, and trailing data are
+// DecodeBatch strictly decodes a JSON array of events. Unknown fields,
+// syntax errors, malformed timestamps, malformed labels, trailing data, and
+// duplicate member names within the outer array's event objects are
 // rejected; callers remain responsible for emptiness and field validation.
+// Names are compared after JSON decoding, so a literal name and its \uXXXX
+// escape of the same text count as a repeat.
 func DecodeBatch(data []byte) ([]Event, error) {
 	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.DisallowUnknownFields()
-	var dtos []rawEventDTO
-	if err := dec.Decode(&dtos); err != nil {
+	open, err := dec.Token()
+	if err != nil {
+		return nil, fmt.Errorf("decode events array: %w", err)
+	}
+	if delim, ok := open.(json.Delim); !ok || delim != '[' {
+		return nil, fmt.Errorf("decode events array: must be an array of event objects")
+	}
+
+	var batch []Event
+	for dec.More() {
+		event, err := decodeEventObject(dec)
+		if err != nil {
+			return nil, err
+		}
+		batch = append(batch, event)
+	}
+
+	if _, err := dec.Token(); err != nil { // closing ']'
 		return nil, fmt.Errorf("decode events array: %w", err)
 	}
 	var extra json.RawMessage
@@ -120,20 +138,77 @@ func DecodeBatch(data []byte) ([]Event, error) {
 		}
 		return nil, fmt.Errorf("decode events array: %w", err)
 	}
-	batch := make([]Event, len(dtos))
-	for i, dto := range dtos {
-		labels, err := decodeLabels(dto.Labels)
+	return batch, nil
+}
+
+// decodeEventObject reads one event object from dec, rejecting unknown
+// members and repeated member names (after JSON unescaping). Values retain
+// the same typed-decoding behavior as a struct decode: strings, RFC3339
+// timestamps, and the strict labels shape.
+func decodeEventObject(dec *json.Decoder) (Event, error) {
+	var event Event
+	open, err := dec.Token()
+	if err != nil {
+		return Event{}, fmt.Errorf("decode events array: %w", err)
+	}
+	if delim, ok := open.(json.Delim); !ok || delim != '{' {
+		return Event{}, fmt.Errorf("decode events array: each entry must be an object")
+	}
+
+	seen := make(map[string]struct{})
+	for dec.More() {
+		keyToken, err := dec.Token()
 		if err != nil {
-			return nil, err
+			return Event{}, fmt.Errorf("decode events array: %w", err)
 		}
-		batch[i] = Event{
-			ID:       dto.ID,
-			Service:  dto.Service,
-			Severity: dto.Severity,
-			Message:  dto.Message,
-			At:       dto.At,
-			Labels:   labels,
+		key, ok := keyToken.(string)
+		if !ok {
+			return Event{}, fmt.Errorf("decode events array: event field names must be strings")
+		}
+		if _, known := allowedEventFields[key]; !known {
+			return Event{}, fmt.Errorf("decode events array: unknown field %q", key)
+		}
+		if _, dup := seen[key]; dup {
+			return Event{}, fmt.Errorf("decode events array: duplicate field %q", key)
+		}
+		seen[key] = struct{}{}
+
+		switch key {
+		case "id":
+			if err := dec.Decode(&event.ID); err != nil {
+				return Event{}, fmt.Errorf("decode events array: id has the wrong type")
+			}
+		case "service":
+			if err := dec.Decode(&event.Service); err != nil {
+				return Event{}, fmt.Errorf("decode events array: service has the wrong type")
+			}
+		case "severity":
+			if err := dec.Decode(&event.Severity); err != nil {
+				return Event{}, fmt.Errorf("decode events array: severity has the wrong type")
+			}
+		case "message":
+			if err := dec.Decode(&event.Message); err != nil {
+				return Event{}, fmt.Errorf("decode events array: message has the wrong type")
+			}
+		case "at":
+			if err := dec.Decode(&event.At); err != nil {
+				return Event{}, fmt.Errorf("decode events array: at must be an RFC3339Nano timestamp")
+			}
+		case "labels":
+			var raw json.RawMessage
+			if err := dec.Decode(&raw); err != nil {
+				return Event{}, fmt.Errorf("decode events array: %w", err)
+			}
+			labels, lerr := decodeLabels(raw)
+			if lerr != nil {
+				return Event{}, lerr
+			}
+			event.Labels = labels
 		}
 	}
-	return batch, nil
+
+	if _, err := dec.Token(); err != nil { // closing '}'
+		return Event{}, fmt.Errorf("decode events array: %w", err)
+	}
+	return event, nil
 }
