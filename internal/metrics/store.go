@@ -87,6 +87,23 @@ type seriesKey struct {
 	labels  string
 }
 
+// instantKey identifies one absolute instant without depending on
+// time.Time's wall fields (which differ across timezone representations and
+// therefore make time.Time unsafe as a map key) or UnixNano, whose int64
+// nanoseconds overflow around the year 2262. Splitting the Unix epoch into
+// seconds and a [0, 1e9) nanosecond offset keeps full nanosecond precision
+// over the whole range time.Parse(RFC3339Nano, ...) accepts.
+type instantKey struct {
+	sec  int64
+	nsec int32
+}
+
+// keyForInstant renders any instant, including ones outside the UnixNano
+// int64 range, as an overflow-free, timezone-independent identity.
+func keyForInstant(at time.Time) instantKey {
+	return instantKey{sec: at.Unix(), nsec: int32(at.Nanosecond())}
+}
+
 // BeforeCommit persists a batch of brand-new samples. It runs while the store
 // lock is held and before the batch becomes visible, so a successful return
 // guarantees the batch is durable and committed atomically.
@@ -139,7 +156,7 @@ func (s *Store) Ingest(batch []Sample, beforeCommit BeforeCommit) (IngestResult,
 	defer s.mu.Unlock()
 
 	pendingID := make(map[string]struct{}, len(normalized))
-	pendingPoint := make(map[seriesKey]map[int64]string, len(normalized))
+	pendingPoint := make(map[seriesKey]map[instantKey]string, len(normalized))
 	var created []Sample
 	var result IngestResult
 	for _, sample := range normalized {
@@ -170,7 +187,7 @@ func (s *Store) Ingest(batch []Sample, beforeCommit BeforeCommit) (IngestResult,
 		}
 		// Nor one introduced earlier in this same batch.
 		if owners := pendingPoint[key]; owners != nil {
-			if owner, dup := owners[sample.At.UnixNano()]; dup && owner != sample.ID {
+			if owner, dup := owners[keyForInstant(sample.At)]; dup && owner != sample.ID {
 				return IngestResult{}, &ConflictError{
 					Reason: "sample collides with a different sample of the same series at the same time"}
 			}
@@ -178,9 +195,9 @@ func (s *Store) Ingest(batch []Sample, beforeCommit BeforeCommit) (IngestResult,
 		created = append(created, sample)
 		result.Created++
 		if pendingPoint[key] == nil {
-			pendingPoint[key] = make(map[int64]string)
+			pendingPoint[key] = make(map[instantKey]string)
 		}
-		pendingPoint[key][sample.At.UnixNano()] = sample.ID
+		pendingPoint[key][keyForInstant(sample.At)] = sample.ID
 	}
 
 	if len(created) > 0 {
