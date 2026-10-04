@@ -21,11 +21,14 @@ type Event struct {
 }
 
 // Query selects events by optional service, severity, and label filters.
+// Since and Until are pointers so an unset bound (nil, meaning unbounded in
+// that direction) is distinguishable from an explicit boundary at the zero
+// instant. Both bounds are inclusive.
 type Query struct {
 	Service  string
 	Severity string
-	Since    time.Time
-	Until    time.Time
+	Since    *time.Time
+	Until    *time.Time
 	Labels   map[string]string
 }
 
@@ -122,10 +125,10 @@ func (s *Store) Query(query Query) []Event {
 		if severity != "" && event.Severity != severity {
 			continue
 		}
-		if !query.Since.IsZero() && event.At.Before(query.Since) {
+		if query.Since != nil && event.At.Before(*query.Since) {
 			continue
 		}
-		if !query.Until.IsZero() && event.At.After(query.Until) {
+		if query.Until != nil && event.At.After(*query.Until) {
 			continue
 		}
 		if !labelsMatch(event.Labels, query.Labels) {

@@ -53,25 +53,19 @@ type snapshotQuery struct {
 }
 
 func snapshotQueryFromQuery(q events.Query) snapshotQuery {
-	sq := snapshotQuery{
+	return snapshotQuery{
 		Service:  strings.TrimSpace(q.Service),
 		Severity: strings.ToLower(strings.TrimSpace(q.Severity)),
+		Since:    q.Since,
+		Until:    q.Until,
 		Labels:   q.Labels,
 	}
-	if !q.Since.IsZero() {
-		t := q.Since
-		sq.Since = &t
-	}
-	if !q.Until.IsZero() {
-		t := q.Until
-		sq.Until = &t
-	}
-	return sq
 }
 
 // matches reports whether q, after the same normalization, is this filter
 // set. Time zones and label order are irrelevant; severity case and
-// surrounding whitespace are normalized away.
+// surrounding whitespace are normalized away. An absent bound (nil) differs
+// from an explicit boundary, even one at the zero instant.
 func (sq snapshotQuery) matches(q events.Query) bool {
 	if sq.Service != strings.TrimSpace(q.Service) {
 		return false
@@ -91,20 +85,16 @@ func (sq snapshotQuery) equal(other snapshotQuery) bool {
 	if sq.Service != other.Service || sq.Severity != other.Severity {
 		return false
 	}
-	if !timePtrPtrEqual(sq.Since, other.Since) || !timePtrPtrEqual(sq.Until, other.Until) {
+	if !timePtrEqual(sq.Since, other.Since) || !timePtrEqual(sq.Until, other.Until) {
 		return false
 	}
 	return maps.Equal(sq.Labels, other.Labels)
 }
 
-func timePtrEqual(p *time.Time, t time.Time) bool {
-	if p == nil {
-		return t.IsZero()
-	}
-	return !t.IsZero() && p.Equal(t)
-}
-
-func timePtrPtrEqual(a, b *time.Time) bool {
+// timePtrEqual compares optional time bounds: nil bounds (absent) are equal
+// only to nil, and set bounds compare by absolute instant so different time
+// zone spellings of the same moment match.
+func timePtrEqual(a, b *time.Time) bool {
 	if a == nil || b == nil {
 		return a == b
 	}
@@ -313,16 +303,16 @@ func buildPageQuery(values url.Values) (events.Query, error) {
 		if err != nil {
 			return events.Query{}, errors.New("since must be an RFC3339Nano timestamp")
 		}
-		q.Since = parsed
+		q.Since = &parsed
 	}
 	if raw := values.Get("until"); raw != "" {
 		parsed, err := time.Parse(time.RFC3339Nano, raw)
 		if err != nil {
 			return events.Query{}, errors.New("until must be an RFC3339Nano timestamp")
 		}
-		q.Until = parsed
+		q.Until = &parsed
 	}
-	if !q.Since.IsZero() && !q.Until.IsZero() && q.Since.After(q.Until) {
+	if q.Since != nil && q.Until != nil && q.Since.After(*q.Until) {
 		return events.Query{}, errors.New("since must not be after until")
 	}
 	return q, nil

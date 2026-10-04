@@ -324,6 +324,59 @@ func TestGetFiltersRangesAndEmpty(t *testing.T) {
 	}
 }
 
+func TestGetExplicitZeroBounds(t *testing.T) {
+	server, _, _ := newTestServer(t)
+	body := `{"events":[
+		{"id":"a","service":"s","severity":"info","message":"m","at":"2026-10-01T09:00:00Z"},
+		{"id":"b","service":"s","severity":"info","message":"m","at":"2026-10-01T09:00:00.000000001Z"}
+	]}`
+	if status, _ := post(t, server, body); status != http.StatusOK {
+		t.Fatal("seed")
+	}
+
+	// until at the zero instant is an explicit upper bound, not "unbounded":
+	// no event after year 1 may appear.
+	status, rows := get(t, server, "?until=0001-01-01T00:00:00Z")
+	if status != http.StatusOK {
+		t.Fatalf("zero until status: %d %v", status, rows)
+	}
+	if arr, ok := rows.([]any); !ok || len(arr) != 0 {
+		t.Fatalf("zero until must return [], got %v", rows)
+	}
+
+	// An event one nanosecond outside a boundary is excluded.
+	status, rows = get(t, server, "?until=2026-10-01T09:00:00Z")
+	if status != http.StatusOK || len(rows.([]any)) != 1 || rows.([]any)[0].(map[string]any)["id"] != "a" {
+		t.Fatalf("until inclusive by the nanosecond: %d %v", status, rows)
+	}
+
+	// since == until at an ordinary instant is allowed and inclusive.
+	status, rows = get(t, server, "?since=2026-10-01T09:00:00Z&until=2026-10-01T09:00:00Z")
+	if status != http.StatusOK || len(rows.([]any)) != 1 || rows.([]any)[0].(map[string]any)["id"] != "a" {
+		t.Fatalf("equal endpoints: %d %v", status, rows)
+	}
+
+	// since strictly after until, including at the zero instant, is a 400.
+	for _, q := range []string{
+		"?since=2026-10-01T09:00:00Z&until=0001-01-01T00:00:00Z",
+		"?since=0001-01-01T00:00:00.000000001Z&until=0001-01-01T00:00:00Z",
+	} {
+		status, out := get(t, server, q)
+		if status != http.StatusBadRequest {
+			t.Fatalf("%s want 400, got %d %v", q, status, out)
+		}
+		if m, _ := out.(map[string]any)["error"].(string); m == "" {
+			t.Fatalf("%s missing non-empty error", q)
+		}
+	}
+
+	// Equivalent timezone spellings of the same zero instant filter alike.
+	status, rows = get(t, server, "?until=0000-12-31T19:00:00-05:00")
+	if status != http.StatusOK || len(rows.([]any)) != 0 {
+		t.Fatalf("equivalent zero-instant timezone spelling: %d %v", status, rows)
+	}
+}
+
 func TestUnknownRouteAndMethod(t *testing.T) {
 	server, _, _ := newTestServer(t)
 	resp, err := http.Get(server.URL + "/nope")

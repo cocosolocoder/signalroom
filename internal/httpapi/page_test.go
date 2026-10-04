@@ -415,6 +415,126 @@ func TestPage503WhenPoisoned(t *testing.T) {
 	}
 }
 
+func TestPageExplicitZeroSincePreservedAcrossPages(t *testing.T) {
+	server, _, _ := newTestServer(t)
+	seedEvents(t, server, 5)
+
+	// First page with an explicit since at the zero instant. It matches all
+	// events but, unlike a missing since, must be saved as a real bound.
+	status, out := page(t, server, "?limit=2&since=0001-01-01T00:00:00Z")
+	if status != http.StatusOK {
+		t.Fatalf("page 1: %d %v", status, out)
+	}
+	events, cursor := pageEvents(t, out)
+	if len(events) != 2 || events[0]["id"] != "e0" || events[1]["id"] != "e1" {
+		t.Fatalf("page 1: %v", events)
+	}
+	if cursor == "" {
+		t.Fatal("page 1 should have a next_cursor")
+	}
+
+	// Continuation with only cursor and limit keeps the saved zero bound.
+	status, out = page(t, server, "?limit=2&cursor="+cursor)
+	if status != http.StatusOK {
+		t.Fatalf("page 2: %d %v", status, out)
+	}
+	events, _ = pageEvents(t, out)
+	if len(events) != 2 || events[0]["id"] != "e2" || events[1]["id"] != "e3" {
+		t.Fatalf("continuation must reuse the saved since: %v", events)
+	}
+}
+
+func TestPageExplicitZeroUntilFiltersAndStaysEmpty(t *testing.T) {
+	server, _, _ := newTestServer(t)
+	seedEvents(t, server, 3)
+
+	// until at the zero instant is an explicit bound: all 2026 events are
+	// after it, so the result is the usual empty form with no cursor.
+	status, out := page(t, server, "?until=0001-01-01T00:00:00Z")
+	if status != http.StatusOK {
+		t.Fatalf("status: %d %v", status, out)
+	}
+	events, next := pageEvents(t, out)
+	if len(events) != 0 {
+		t.Fatalf("zero until must return [], got %v", events)
+	}
+	if next != "" {
+		t.Fatalf("zero until must have null next_cursor, got %q", next)
+	}
+
+	// A boundary one nanosecond tighter also excludes the event exactly a
+	// nanosecond after it.
+	status, out = page(t, server, "?until=2026-10-01T08:59:59.999999999Z")
+	if status != http.StatusOK {
+		t.Fatalf("status: %d %v", status, out)
+	}
+	if events, _ = pageEvents(t, out); len(events) != 0 {
+		t.Fatalf("event a nanosecond after until must be excluded: %v", events)
+	}
+}
+
+func TestPageZeroBoundPresenceIsPartOfFilterSet(t *testing.T) {
+	server, _, _ := newTestServer(t)
+	seedEvents(t, server, 5)
+
+	first := url.Values{}
+	first.Set("limit", "2")
+	first.Set("service", "s")
+	first.Set("since", "0001-01-01T00:00:00Z")
+	status, out := page(t, server, "?"+first.Encode())
+	if status != http.StatusOK {
+		t.Fatalf("first page: %d %v", status, out)
+	}
+	events, cursor := pageEvents(t, out)
+	if len(events) != 2 || events[0]["id"] != "e0" || events[1]["id"] != "e1" {
+		t.Fatalf("first page: %v", events)
+	}
+
+	// Carrying filters but omitting the since makes its full filter set a
+	// missing bound, which differs from the explicit zero instant even
+	// though both would select the same events.
+	missing := url.Values{}
+	missing.Set("limit", "2")
+	missing.Set("cursor", cursor)
+	missing.Set("service", "s")
+	status, out = page(t, server, "?"+missing.Encode())
+	if status != http.StatusBadRequest {
+		t.Fatalf("missing bound vs explicit zero must be 400, got %d %v", status, out)
+	}
+	if msg, _ := out["error"].(string); msg == "" {
+		t.Fatal("filter mismatch needs a non-empty error")
+	}
+
+	// Expressing the same zero instant in another time zone is the same
+	// condition, so paging continues from where the first page stopped.
+	equiv := url.Values{}
+	equiv.Set("limit", "2")
+	equiv.Set("cursor", cursor)
+	equiv.Set("service", "s")
+	equiv.Set("since", "0001-01-01T08:00:00+08:00")
+	status, out = page(t, server, "?"+equiv.Encode())
+	if status != http.StatusOK {
+		t.Fatalf("equivalent timezone should continue, got %d %v", status, out)
+	}
+	events, _ = pageEvents(t, out)
+	if len(events) != 2 || events[0]["id"] != "e2" || events[1]["id"] != "e3" {
+		t.Fatalf("equivalent continuation must resume from e2: %v", events)
+	}
+
+	// Carrying an explicit until where the snapshot had none is likewise a
+	// different condition.
+	added := url.Values{}
+	added.Set("limit", "2")
+	added.Set("cursor", cursor)
+	added.Set("service", "s")
+	added.Set("since", "0001-01-01T00:00:00Z")
+	added.Set("until", "0001-01-01T00:00:00Z")
+	status, out = page(t, server, "?"+added.Encode())
+	if status != http.StatusBadRequest {
+		t.Fatalf("adding an until bound must be 400, got %d %v", status, out)
+	}
+}
+
 func TestPageMethodNotAllowed(t *testing.T) {
 	server, _, _ := newTestServer(t)
 	resp, err := http.Post(server.URL+"/events/page", "application/json", nil)

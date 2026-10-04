@@ -176,7 +176,9 @@ func TestTimelineQueryFiltersAndOrder(t *testing.T) {
 	if ids(got) != "a,b" {
 		t.Fatalf("severity filter (same-time tie by id): %s", ids(got))
 	}
-	got = tl.Query(Query{Since: base.Add(30 * time.Second), Until: base.Add(90 * time.Second)})
+	since := base.Add(30 * time.Second)
+	until := base.Add(90 * time.Second)
+	got = tl.Query(Query{Since: &since, Until: &until})
 	if ids(got) != "d" {
 		t.Fatalf("inclusive range: %s", ids(got))
 	}

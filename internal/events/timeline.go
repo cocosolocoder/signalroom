@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 // BeforeCommit persists a batch of brand-new events. It runs while the
@@ -120,6 +121,20 @@ func (t *Timeline) SortAll() {
 	})
 }
 
+// withinBounds reports whether at falls in the inclusive [Since, Until]
+// range. A nil bound means unbounded in that direction, so an explicit
+// boundary at the zero instant is still applied. Comparisons use absolute
+// instants, so time zone spellings of the same moment agree.
+func (q Query) withinBounds(at time.Time) bool {
+	if q.Since != nil && at.Before(*q.Since) {
+		return false
+	}
+	if q.Until != nil && at.After(*q.Until) {
+		return false
+	}
+	return true
+}
+
 // Query returns the events matching the optional filters, ordered by time and
 // then by id. Time equality uses absolute instants.
 func (t *Timeline) Query(query Query) []Event {
@@ -136,10 +151,7 @@ func (t *Timeline) Query(query Query) []Event {
 		if severity != "" && event.Severity != severity {
 			continue
 		}
-		if !query.Since.IsZero() && event.At.Before(query.Since) {
-			continue
-		}
-		if !query.Until.IsZero() && event.At.After(query.Until) {
+		if !query.withinBounds(event.At) {
 			continue
 		}
 		if !labelsMatch(event.Labels, query.Labels) {
@@ -169,10 +181,7 @@ func (t *Timeline) SnapshotIDs(query Query) []string {
 		if severity != "" && event.Severity != severity {
 			continue
 		}
-		if !query.Since.IsZero() && event.At.Before(query.Since) {
-			continue
-		}
-		if !query.Until.IsZero() && event.At.After(query.Until) {
+		if !query.withinBounds(event.At) {
 			continue
 		}
 		if !labelsMatch(event.Labels, query.Labels) {

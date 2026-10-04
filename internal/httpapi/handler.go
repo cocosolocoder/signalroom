@@ -191,7 +191,7 @@ func (h *Handler) getEvents(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "since must be an RFC3339Nano timestamp")
 			return
 		}
-		query.Since = parsed
+		query.Since = &parsed
 	}
 	if raw := values.Get("until"); raw != "" {
 		parsed, err := time.Parse(time.RFC3339Nano, raw)
@@ -199,9 +199,9 @@ func (h *Handler) getEvents(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "until must be an RFC3339Nano timestamp")
 			return
 		}
-		query.Until = parsed
+		query.Until = &parsed
 	}
-	if !query.Since.IsZero() && !query.Until.IsZero() && query.Since.After(query.Until) {
+	if query.Since != nil && query.Until != nil && query.Since.After(*query.Until) {
 		writeError(w, http.StatusBadRequest, "since must not be after until")
 		return
 	}
