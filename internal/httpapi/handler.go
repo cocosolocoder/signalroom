@@ -192,6 +192,7 @@ func (h *Handler) getEvents(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		query.Since = parsed
+		query.SinceSet = true
 	}
 	if raw := values.Get("until"); raw != "" {
 		parsed, err := time.Parse(time.RFC3339Nano, raw)
@@ -200,8 +201,9 @@ func (h *Handler) getEvents(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		query.Until = parsed
+		query.UntilSet = true
 	}
-	if !query.Since.IsZero() && !query.Until.IsZero() && query.Since.After(query.Until) {
+	if query.SinceApplied() && query.UntilApplied() && query.Since.After(query.Until) {
 		writeError(w, http.StatusBadRequest, "since must not be after until")
 		return
 	}

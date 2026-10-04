@@ -21,13 +21,29 @@ type Event struct {
 }
 
 // Query selects events by optional service, severity, and label filters.
+// Since and Until bound the event time inclusively on either side.
 type Query struct {
 	Service  string
 	Severity string
 	Since    time.Time
 	Until    time.Time
+	// SinceSet and UntilSet record that the caller explicitly provided the
+	// bound. The zero instant is a legitimate bound value, so presence
+	// cannot be inferred from the value alone.
+	SinceSet bool
+	UntilSet bool
 	Labels   map[string]string
 }
+
+// SinceApplied reports whether the query filters out events before Since.
+// A non-zero Since implies a bound even without the flag, so callers that
+// only ever use non-zero bounds need not set SinceSet.
+func (q Query) SinceApplied() bool { return q.SinceSet || !q.Since.IsZero() }
+
+// UntilApplied reports whether the query filters out events after Until.
+// A non-zero Until implies a bound even without the flag, so callers that
+// only ever use non-zero bounds need not set UntilSet.
+func (q Query) UntilApplied() bool { return q.UntilSet || !q.Until.IsZero() }
 
 // ValidationError reports that an event failed normalization.
 type ValidationError struct{ Reason string }
@@ -122,10 +138,10 @@ func (s *Store) Query(query Query) []Event {
 		if severity != "" && event.Severity != severity {
 			continue
 		}
-		if !query.Since.IsZero() && event.At.Before(query.Since) {
+		if query.SinceApplied() && event.At.Before(query.Since) {
 			continue
 		}
-		if !query.Until.IsZero() && event.At.After(query.Until) {
+		if query.UntilApplied() && event.At.After(query.Until) {
 			continue
 		}
 		if !labelsMatch(event.Labels, query.Labels) {

@@ -136,10 +136,10 @@ func (t *Timeline) Query(query Query) []Event {
 		if severity != "" && event.Severity != severity {
 			continue
 		}
-		if !query.Since.IsZero() && event.At.Before(query.Since) {
+		if query.SinceApplied() && event.At.Before(query.Since) {
 			continue
 		}
-		if !query.Until.IsZero() && event.At.After(query.Until) {
+		if query.UntilApplied() && event.At.After(query.Until) {
 			continue
 		}
 		if !labelsMatch(event.Labels, query.Labels) {
@@ -169,10 +169,10 @@ func (t *Timeline) SnapshotIDs(query Query) []string {
 		if severity != "" && event.Severity != severity {
 			continue
 		}
-		if !query.Since.IsZero() && event.At.Before(query.Since) {
+		if query.SinceApplied() && event.At.Before(query.Since) {
 			continue
 		}
-		if !query.Until.IsZero() && event.At.After(query.Until) {
+		if query.UntilApplied() && event.At.After(query.Until) {
 			continue
 		}
 		if !labelsMatch(event.Labels, query.Labels) {

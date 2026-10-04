@@ -58,11 +58,11 @@ func snapshotQueryFromQuery(q events.Query) snapshotQuery {
 		Severity: strings.ToLower(strings.TrimSpace(q.Severity)),
 		Labels:   q.Labels,
 	}
-	if !q.Since.IsZero() {
+	if q.SinceApplied() {
 		t := q.Since
 		sq.Since = &t
 	}
-	if !q.Until.IsZero() {
+	if q.UntilApplied() {
 		t := q.Until
 		sq.Until = &t
 	}
@@ -79,7 +79,7 @@ func (sq snapshotQuery) matches(q events.Query) bool {
 	if sq.Severity != strings.ToLower(strings.TrimSpace(q.Severity)) {
 		return false
 	}
-	if !timePtrEqual(sq.Since, q.Since) || !timePtrEqual(sq.Until, q.Until) {
+	if !timePtrEqual(sq.Since, q.SinceApplied(), q.Since) || !timePtrEqual(sq.Until, q.UntilApplied(), q.Until) {
 		return false
 	}
 	return maps.Equal(sq.Labels, q.Labels)
@@ -97,11 +97,15 @@ func (sq snapshotQuery) equal(other snapshotQuery) bool {
 	return maps.Equal(sq.Labels, other.Labels)
 }
 
-func timePtrEqual(p *time.Time, t time.Time) bool {
+// timePtrEqual compares a stored bound with a requested one. set reports
+// whether the request carries the bound at all; a stored nil matches only an
+// absent bound, and a stored zero instant matches only an explicitly
+// provided zero instant.
+func timePtrEqual(p *time.Time, set bool, t time.Time) bool {
 	if p == nil {
-		return t.IsZero()
+		return !set
 	}
-	return !t.IsZero() && p.Equal(t)
+	return set && p.Equal(t)
 }
 
 func timePtrPtrEqual(a, b *time.Time) bool {
@@ -314,6 +318,7 @@ func buildPageQuery(values url.Values) (events.Query, error) {
 			return events.Query{}, errors.New("since must be an RFC3339Nano timestamp")
 		}
 		q.Since = parsed
+		q.SinceSet = true
 	}
 	if raw := values.Get("until"); raw != "" {
 		parsed, err := time.Parse(time.RFC3339Nano, raw)
@@ -321,8 +326,9 @@ func buildPageQuery(values url.Values) (events.Query, error) {
 			return events.Query{}, errors.New("until must be an RFC3339Nano timestamp")
 		}
 		q.Until = parsed
+		q.UntilSet = true
 	}
-	if !q.Since.IsZero() && !q.Until.IsZero() && q.Since.After(q.Until) {
+	if q.SinceApplied() && q.UntilApplied() && q.Since.After(q.Until) {
 		return events.Query{}, errors.New("since must not be after until")
 	}
 	return q, nil
