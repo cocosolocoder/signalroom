@@ -34,7 +34,10 @@ fail with a non-zero status without modifying the data.
 Submit a batch. The body must be a JSON object containing exactly an `events`
 array. Each event uses the fields `id`, `service`, `severity`, `message` and
 `at`, plus an optional `labels` object; `at` is an RFC3339Nano timestamp.
-Unknown fields are rejected. String fields are trimmed and `severity` is
+Unknown fields are rejected, and naming the same field twice within the
+request object, any event object, or a labels object is rejected even when
+the two values are identical (a literal name and its Unicode-escape spelling
+count as the same field). String fields are trimmed and `severity` is
 lowercased; `id`, `service`, `message` and `at` are required.
 
 `labels` is a JSON object of string to string (for example

@@ -4,8 +4,6 @@ package httpapi
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
-	"io"
 	"net/http"
 	"time"
 
@@ -23,8 +21,10 @@ type Storage interface {
 	Poisoned() bool
 }
 
-type envelope struct {
-	Events json.RawMessage `json:"events"`
+// allowedEventsFields is the exact set of members a POST /events body may
+// carry.
+var allowedEventsFields = map[string]struct{}{
+	"events": {},
 }
 
 // Handler wires the timeline, its durable log, and the cursor store to HTTP
@@ -116,30 +116,19 @@ func (h *Handler) postEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
+	body, err := readJSONObjectBody(w, r, allowedEventsFields)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-
-	dec := json.NewDecoder(bytes.NewReader(body))
-	dec.DisallowUnknownFields()
-	var input envelope
-	if err := dec.Decode(&input); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
-		return
-	}
-	var extra json.RawMessage
-	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
-		return
-	}
-	if len(bytes.TrimSpace(input.Events)) == 0 {
+	rawEvents, present := body["events"]
+	trimmed := bytes.TrimSpace(rawEvents)
+	if !present || bytes.Equal(trimmed, []byte("null")) {
 		writeError(w, http.StatusBadRequest, "events must be a non-empty array")
 		return
 	}
 
-	batch, err := events.DecodeBatch(input.Events)
+	batch, err := events.DecodeBatch(rawEvents)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid events array")
 		return

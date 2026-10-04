@@ -38,6 +38,58 @@ func TestDecodeBatchLabels(t *testing.T) {
 	}
 }
 
+func TestDecodeBatchRejectsDuplicateEventFields(t *testing.T) {
+	head := `[{"id":"e1","service":"s","severity":"info","message":"m","at":"2026-10-01T09:00:00Z"`
+	cases := map[string]string{
+		"duplicate id":            head + `,"id":"e2"}]`,
+		"duplicate id same value": head + `,"id":"e1"}]`,
+		"duplicate service":       head + `,"service":"s2"}]`,
+		"duplicate severity":      head + `,"severity":"info"}]`,
+		"duplicate message":       head + `,"message":"m2"}]`,
+		"duplicate at":            head + `,"at":"2026-10-01T09:01:00Z"}]`,
+		// A bad labels object hidden by a second, legal one must not survive.
+		"duplicate labels bad first":  head + `,"labels":{"env":1},"labels":{"env":"prod"}}]`,
+		"duplicate labels null first": head + `,"labels":null,"labels":{"env":"prod"}}]`,
+		"duplicate labels identical":  head + `,"labels":{"env":"prod"},"labels":{"env":"prod"}}]`,
+		// The same name written literally and as a Unicode escape collides after
+		// JSON decoding: \u0069d == "id", \u0065nv == "env", \u006cabels == "labels".
+		"duplicate id unicode escape":     `[{"id":"e1","\u0069d":"e2","service":"s","severity":"info","message":"m","at":"2026-10-01T09:00:00Z"}]`,
+		"duplicate labels unicode escape": `[{"id":"e1","service":"s","severity":"info","message":"m","at":"2026-10-01T09:00:00Z","labels":{"env":"a","\u0065nv":"b"}}]`,
+		"duplicate labels member unicode": head + `,"labels":{"env":"prod"},"\u006cabels":{"env":"prod"}}]`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := DecodeBatch([]byte(body)); err == nil {
+				t.Fatal("want decode error for duplicate field")
+			}
+		})
+	}
+}
+
+func TestDecodeBatchDuplicateFieldScopedToObject(t *testing.T) {
+	// The same field name in two different event objects is normal; only a
+	// repeat within one object is ambiguous.
+	body := `[
+		{"id":"e1","service":"s","severity":"info","message":"m","at":"2026-10-01T09:00:00Z","labels":{"env":"prod"}},
+		{"id":"e2","service":"s","severity":"info","message":"m","at":"2026-10-01T09:01:00Z","labels":{"env":"stage"}}
+	]`
+	batch, err := DecodeBatch([]byte(body))
+	if err != nil {
+		t.Fatalf("same-named fields across events must decode: %v", err)
+	}
+	if len(batch) != 2 || batch[0].Labels["env"] != "prod" || batch[1].Labels["env"] != "stage" {
+		t.Fatalf("unexpected batch: %+v", batch)
+	}
+}
+
+func TestDecodeBatchRejectsNonObjectEvent(t *testing.T) {
+	for _, body := range []string{`[1]`, `["x"]`, `[null]`, `[[{}]]`} {
+		if _, err := DecodeBatch([]byte(body)); err == nil {
+			t.Fatalf("non-object event must fail: %s", body)
+		}
+	}
+}
+
 func TestDecodeBatchRejectsBadLabels(t *testing.T) {
 	cases := map[string]string{
 		"duplicate keys":   `"labels":{"env":"a","env":"a"}`,
