@@ -84,35 +84,35 @@ func (r *Registry) checkLoadedAction(state *incidentState, req Request) error {
 		if state.status != StatusResolved {
 			return validationErr("reopen action %q on non-resolved incident in log", req.ActionID)
 		}
-	case ActionAddParticipant:
-		if state.status != StatusOpen {
-			return validationErr("add_participant action %q on %s incident in log", req.ActionID, state.status)
-		}
-		if _, member := state.participantSet[req.Content]; member {
-			return validationErr("participant %q added twice in incident %q log", req.Content, state.id)
-		}
-	case ActionRemoveParticipant:
-		if state.status != StatusOpen {
-			return validationErr("remove_participant action %q on %s incident in log", req.ActionID, state.status)
-		}
-		if _, member := state.participantSet[req.Content]; !member {
-			return validationErr("participant %q removed without joining in incident %q log", req.Content, state.id)
-		}
-		if req.Content == state.owner {
-			return validationErr("current owner %q removed in incident %q log", req.Content, state.id)
-		}
-	case ActionAssignOwner:
-		if state.status != StatusOpen {
-			return validationErr("assign_owner action %q on %s incident in log", req.ActionID, state.status)
-		}
-		if _, member := state.participantSet[req.Content]; !member {
-			return validationErr("incident %q handed to non-participant %q in log", state.id, req.Content)
-		}
-		if req.Content == state.owner {
-			return validationErr("owner %q handed over to itself in incident %q log", req.Content, state.id)
-		}
+	case ActionAddParticipant, ActionRemoveParticipant, ActionAssignOwner:
+		return checkLoadedPersonnelAction(state, req)
 	default:
 		return validationErr("unknown action %q in log", req.Type)
+	}
+	return nil
+}
+
+// checkLoadedPersonnelAction re-runs the shared personnel rules while
+// replaying a durable record. A violation means the log contradicts the
+// rules the live path enforced at commit time, so startup fails. The
+// wording stays replay-specific ("in log"); the constraints themselves are
+// checkPersonnelAction's, the single place both paths maintain.
+func checkLoadedPersonnelAction(state *incidentState, req Request) error {
+	switch checkPersonnelAction(state, req) {
+	case personnelOK:
+		return nil
+	case personnelClosed:
+		return validationErr("%s action %q on %s incident in log", req.Type, req.ActionID, state.status)
+	case personnelAlreadyMember:
+		return validationErr("participant %q added twice in incident %q log", req.Content, state.id)
+	case personnelNotMember:
+		return validationErr("participant %q removed without joining in incident %q log", req.Content, state.id)
+	case personnelRemoveOwner:
+		return validationErr("current owner %q removed in incident %q log", req.Content, state.id)
+	case personnelOwnerNonMember:
+		return validationErr("incident %q handed to non-participant %q in log", state.id, req.Content)
+	case personnelOwnerUnchanged:
+		return validationErr("owner %q handed over to itself in incident %q log", req.Content, state.id)
 	}
 	return nil
 }

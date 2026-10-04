@@ -420,34 +420,87 @@ func (r *Registry) checkAction(state *incidentState, req Request) error {
 			return conflictErr(state.version, "incident %q is not resolved", state.id)
 		}
 	case ActionAddParticipant, ActionRemoveParticipant, ActionAssignOwner:
-		if state.status != StatusOpen {
-			return conflictErr(state.version, "cannot %s on a %s incident", participantRuleName(req.Type), state.status)
+		if err := personnelConflictError(state, req); err != nil {
+			return err
 		}
-		switch req.Type {
-		case ActionAddParticipant:
-			if _, member := state.participantSet[req.Content]; member {
-				return conflictErr(state.version,
-					"%q is already a participant of incident %q", req.Content, state.id)
-			}
-		case ActionRemoveParticipant:
-			if _, member := state.participantSet[req.Content]; !member {
-				return conflictErr(state.version,
-					"%q is not a participant of incident %q", req.Content, state.id)
-			}
-			if req.Content == state.owner {
-				return conflictErr(state.version,
-					"cannot remove the current owner %q from incident %q", req.Content, state.id)
-			}
-		case ActionAssignOwner:
-			if _, member := state.participantSet[req.Content]; !member {
-				return conflictErr(state.version,
-					"cannot hand incident %q to non-participant %q", state.id, req.Content)
-			}
-			if req.Content == state.owner {
-				return conflictErr(state.version,
-					"%q is already the owner of incident %q", req.Content, state.id)
-			}
+	}
+	return nil
+}
+
+// personnelViolation identifies one broken personnel rule without binding
+// it to an error vocabulary: the live request path turns it into a conflict
+// carrying the current version, while startup replay turns it into a log
+// inconsistency. Keeping the judgment independent of the wording means both
+// entry paths enforce the very same business constraints.
+type personnelViolation int
+
+const (
+	personnelOK personnelViolation = iota
+	// personnelClosed: a personnel action was attempted while not open.
+	personnelClosed
+	// personnelAlreadyMember: the add target already participates.
+	personnelAlreadyMember
+	// personnelNotMember: the remove target does not participate.
+	personnelNotMember
+	// personnelRemoveOwner: the remove target is the current owner.
+	personnelRemoveOwner
+	// personnelOwnerNonMember: the handover target does not participate.
+	personnelOwnerNonMember
+	// personnelOwnerUnchanged: the handover target is already the owner.
+	personnelOwnerUnchanged
+)
+
+// checkPersonnelAction evaluates the personnel rules shared by the live
+// request path and startup replay: personnel actions are accepted only
+// while the incident is open; an added person must not already participate;
+// a removed person must participate without being the current owner; an
+// owner handover must target a different, already participating person.
+func checkPersonnelAction(state *incidentState, req Request) personnelViolation {
+	if state.status != StatusOpen {
+		return personnelClosed
+	}
+	switch req.Type {
+	case ActionAddParticipant:
+		if _, member := state.participantSet[req.Content]; member {
+			return personnelAlreadyMember
 		}
+	case ActionRemoveParticipant:
+		if _, member := state.participantSet[req.Content]; !member {
+			return personnelNotMember
+		}
+		if req.Content == state.owner {
+			return personnelRemoveOwner
+		}
+	case ActionAssignOwner:
+		if _, member := state.participantSet[req.Content]; !member {
+			return personnelOwnerNonMember
+		}
+		if req.Content == state.owner {
+			return personnelOwnerUnchanged
+		}
+	}
+	return personnelOK
+}
+
+// personnelConflictError renders a shared personnel violation in the live
+// request path's vocabulary: a 409-style conflict carrying the current
+// version.
+func personnelConflictError(state *incidentState, req Request) error {
+	switch checkPersonnelAction(state, req) {
+	case personnelOK:
+		return nil
+	case personnelClosed:
+		return conflictErr(state.version, "cannot %s on a %s incident", participantRuleName(req.Type), state.status)
+	case personnelAlreadyMember:
+		return conflictErr(state.version, "%q is already a participant of incident %q", req.Content, state.id)
+	case personnelNotMember:
+		return conflictErr(state.version, "%q is not a participant of incident %q", req.Content, state.id)
+	case personnelRemoveOwner:
+		return conflictErr(state.version, "cannot remove the current owner %q from incident %q", req.Content, state.id)
+	case personnelOwnerNonMember:
+		return conflictErr(state.version, "cannot hand incident %q to non-participant %q", state.id, req.Content)
+	case personnelOwnerUnchanged:
+		return conflictErr(state.version, "%q is already the owner of incident %q", req.Content, state.id)
 	}
 	return nil
 }
