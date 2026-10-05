@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"errors"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -293,5 +294,200 @@ func TestAggregateSeriesSegmentLimit(t *testing.T) {
 	_, err := s.Aggregate(q(0, 10000, 1, "req"))
 	if !errors.Is(err, ErrTooManySeriesSegments) {
 		t.Fatalf("series-segment limit: %v", err)
+	}
+}
+
+// batchVisibilityFixture builds the shared scenario for the batch-visibility
+// regression tests: one metric name with two existing label-distinct series,
+// and a batch that appends to both, introduces a third series, carries a late
+// sample before the window start (changing the first in-window sample's
+// predecessor), and includes a sample exactly at the window end (excluded).
+// The window [100,160) with step 20 yields three segments, so the batch moves
+// the series set, per-segment counts, and per-segment deltas all at once.
+// Batch order is deliberately scrambled: results must follow sample time.
+func batchVisibilityFixture() (pre []Sample, batch []Sample, query AggregateQuery) {
+	query = q(100, 160, 20, "req")
+	pre = []Sample{
+		{ID: "a0", Service: "gw", Name: "req", At: at(90), Value: 100, Labels: map[string]string{"env": "prod"}},
+		{ID: "a1", Service: "gw", Name: "req", At: at(105), Value: 110, Labels: map[string]string{"env": "prod"}},
+		{ID: "a2", Service: "gw", Name: "req", At: at(130), Value: 120, Labels: map[string]string{"env": "prod"}},
+		{ID: "a3", Service: "gw", Name: "req", At: at(160), Value: 140, Labels: map[string]string{"env": "prod"}}, // at window end: excluded
+		{ID: "b1", Service: "gw", Name: "req", At: at(110), Value: 50, Labels: map[string]string{"env": "staging"}},
+		{ID: "b2", Service: "gw", Name: "req", At: at(125), Value: 55, Labels: map[string]string{"env": "staging"}},
+	}
+	batch = []Sample{
+		{ID: "c2", Service: "gw", Name: "req", At: at(122), Value: 9, Labels: map[string]string{"env": "canary"}},
+		{ID: "a4", Service: "gw", Name: "req", At: at(95), Value: 108, Labels: map[string]string{"env": "prod"}}, // late: new predecessor of a1
+		{ID: "b4", Service: "gw", Name: "req", At: at(160), Value: 70, Labels: map[string]string{"env": "staging"}}, // at window end: excluded
+		{ID: "a5", Service: "gw", Name: "req", At: at(145), Value: 135, Labels: map[string]string{"env": "prod"}},
+		{ID: "c1", Service: "gw", Name: "req", At: at(102), Value: 7, Labels: map[string]string{"env": "canary"}},
+		{ID: "b3", Service: "gw", Name: "req", At: at(150), Value: 60, Labels: map[string]string{"env": "staging"}},
+	}
+	return pre, batch, query
+}
+
+func seg(start, end int64, count int, delta float64) AggregateSegment {
+	return AggregateSegment{Start: at(start), End: at(end), Count: count, Delta: delta}
+}
+
+// wantPreState and wantPostState list series in the store's deterministic
+// order (service, then canonical label set; the length-prefixed rendering
+// sorts "prod" < "canary" < "staging" here).
+func wantPreState() []AggregateSeries {
+	return []AggregateSeries{
+		{Service: "gw", Labels: map[string]string{"env": "prod"}, Segments: []AggregateSegment{
+			seg(100, 120, 1, 10), seg(120, 140, 1, 10), seg(140, 160, 0, 0),
+		}},
+		{Service: "gw", Labels: map[string]string{"env": "staging"}, Segments: []AggregateSegment{
+			seg(100, 120, 1, 0), seg(120, 140, 1, 5), seg(140, 160, 0, 0),
+		}},
+	}
+}
+
+func wantPostState() []AggregateSeries {
+	return []AggregateSeries{
+		// a4@95 (108) replaces a0@90 (100) as a1's predecessor: seg0 delta 2.
+		// a5@145 fills seg2. a3@160 stays excluded.
+		{Service: "gw", Labels: map[string]string{"env": "prod"}, Segments: []AggregateSegment{
+			seg(100, 120, 1, 2), seg(120, 140, 1, 10), seg(140, 160, 1, 15),
+		}},
+		{Service: "gw", Labels: map[string]string{"env": "canary"}, Segments: []AggregateSegment{
+			seg(100, 120, 1, 0), seg(120, 140, 1, 2), seg(140, 160, 0, 0),
+		}},
+		// b4@160 stays excluded; b3@150 fills seg2.
+		{Service: "gw", Labels: map[string]string{"env": "staging"}, Segments: []AggregateSegment{
+			seg(100, 120, 1, 0), seg(120, 140, 1, 5), seg(140, 160, 1, 5),
+		}},
+	}
+}
+
+func TestAggregateConcurrentBatchVisibility(t *testing.T) {
+	pre, batch, query := batchVisibilityFixture()
+	s := NewStore()
+	mustIngest(t, s, pre)
+
+	preState, postState := wantPreState(), wantPostState()
+	got, err := s.Aggregate(query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, preState) {
+		t.Fatalf("pre-state mismatch:\n got %+v\nwant %+v", got, preState)
+	}
+
+	// Readers racing the commit start may land on either side of it.
+	const racingReaders = 4
+	type result struct {
+		series []AggregateSeries
+		err    error
+	}
+	racing := make(chan result, racingReaders)
+	for i := 0; i < racingReaders; i++ {
+		go func() {
+			series, err := s.Aggregate(query)
+			racing <- result{series, err}
+		}()
+	}
+
+	// The commit blocks mid-flight holding the write lock; readers starting
+	// now must wait for it and may only observe a complete committed state.
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	ingestDone := make(chan error, 1)
+	go func() {
+		_, err := s.Ingest(batch, func([]Sample) error {
+			close(entered)
+			<-release
+			return nil
+		})
+		ingestDone <- err
+	}()
+	<-entered
+
+	const waitingReaders = 8
+	waiting := make(chan result, waitingReaders)
+	for i := 0; i < waitingReaders; i++ {
+		go func() {
+			series, err := s.Aggregate(query)
+			waiting <- result{series, err}
+		}()
+	}
+
+	// Waiting for the in-flight commit is allowed, but no reader may return
+	// while the batch is only partly applied.
+	select {
+	case r := <-waiting:
+		t.Fatalf("query returned while commit in flight: %+v", r.series)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(release)
+	if err := <-ingestDone; err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+
+	// Each racing reader saw exactly one of the two committed states.
+	for i := 0; i < racingReaders; i++ {
+		r := <-racing
+		if r.err != nil {
+			t.Fatalf("racing reader: %v", r.err)
+		}
+		if !reflect.DeepEqual(r.series, preState) && !reflect.DeepEqual(r.series, postState) {
+			t.Fatalf("racing reader saw a mixed state:\n got %+v\nwant %+v\nor   %+v", r.series, preState, postState)
+		}
+	}
+
+	for i := 0; i < waitingReaders; i++ {
+		select {
+		case r := <-waiting:
+			if r.err != nil {
+				t.Fatalf("waiting reader: %v", r.err)
+			}
+			if !reflect.DeepEqual(r.series, postState) {
+				t.Fatalf("reader saw a mixed state, not the committed batch:\n got %+v\nwant %+v", r.series, postState)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("query did not return after the commit was released")
+		}
+	}
+
+	// After the commit, the same query shows the batch's full effect.
+	got, err = s.Aggregate(query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, postState) {
+		t.Fatalf("post-commit mismatch:\n got %+v\nwant %+v", got, postState)
+	}
+}
+
+func TestAggregateUnaffectedByRejectedBatch(t *testing.T) {
+	pre, batch, query := batchVisibilityFixture()
+	s := NewStore()
+	mustIngest(t, s, pre)
+
+	before, err := s.Aggregate(query)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// One sample claims an existing series' absolute instant under a
+	// different id: the whole batch is rejected and none of its valid
+	// samples may become visible.
+	rejected := append([]Sample{}, batch...)
+	rejected = append(rejected, Sample{
+		ID: "clash", Service: "gw", Name: "req", At: at(105), Value: 999,
+		Labels: map[string]string{"env": "prod"},
+	})
+	if _, err := s.Ingest(rejected, noopCommit); !IsConflictError(err) {
+		t.Fatalf("want conflict, got %v", err)
+	}
+
+	after, err := s.Aggregate(query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("rejected batch changed the aggregate:\nbefore %+v\nafter  %+v", before, after)
 	}
 }

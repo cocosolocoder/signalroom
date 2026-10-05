@@ -6,9 +6,11 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/cocosolocoder/signalroom/internal/events"
 	"github.com/cocosolocoder/signalroom/internal/metrics"
@@ -39,7 +41,7 @@ func (f *fakeMetricStorage) Poisoned() bool {
 	return f.poisoned
 }
 
-func newMetricsServer(t *testing.T, store *metrics.Store, mstore *fakeMetricStorage) *httptest.Server {
+func newMetricsServer(t *testing.T, store *metrics.Store, mstore MetricStorage) *httptest.Server {
 	t.Helper()
 	if store == nil {
 		store = metrics.NewStore()
@@ -347,5 +349,314 @@ func TestGetMetricsAggregateServiceAndLabelFilters(t *testing.T) {
 	labels := out[0]["labels"].(map[string]any)
 	if labels["env"] != "prod" {
 		t.Fatalf("labels: %v", labels)
+	}
+}
+
+// Batch-visibility regression scenario: one metric name with two existing
+// label-distinct series. The batch appends to both, introduces a third
+// series, carries a late sample before the window start (changing the first
+// in-window sample's predecessor), and includes a sample exactly at the
+// window end (excluded). The window has three segments, so committing the
+// batch moves the series set, per-segment counts, and per-segment deltas.
+// Batch order is deliberately scrambled: results must follow sample time.
+const (
+	aggVisibilityPreBody = `{"samples":[
+		{"id":"a0","service":"gw","name":"requests","at":"2026-10-01T09:59:50Z","value":100,"labels":{"env":"prod"}},
+		{"id":"a1","service":"gw","name":"requests","at":"2026-10-01T10:00:05Z","value":110,"labels":{"env":"prod"}},
+		{"id":"a2","service":"gw","name":"requests","at":"2026-10-01T10:00:30Z","value":120,"labels":{"env":"prod"}},
+		{"id":"a3","service":"gw","name":"requests","at":"2026-10-01T10:01:00Z","value":140,"labels":{"env":"prod"}},
+		{"id":"b1","service":"gw","name":"requests","at":"2026-10-01T10:00:10Z","value":50,"labels":{"env":"staging"}},
+		{"id":"b2","service":"gw","name":"requests","at":"2026-10-01T10:00:25Z","value":55,"labels":{"env":"staging"}}
+	]}`
+	aggVisibilityBatchBody = `{"samples":[
+		{"id":"c2","service":"gw","name":"requests","at":"2026-10-01T10:00:22Z","value":9,"labels":{"env":"canary"}},
+		{"id":"a4","service":"gw","name":"requests","at":"2026-10-01T09:59:55Z","value":108,"labels":{"env":"prod"}},
+		{"id":"b4","service":"gw","name":"requests","at":"2026-10-01T10:01:00Z","value":70,"labels":{"env":"staging"}},
+		{"id":"a5","service":"gw","name":"requests","at":"2026-10-01T10:00:45Z","value":135,"labels":{"env":"prod"}},
+		{"id":"c1","service":"gw","name":"requests","at":"2026-10-01T10:00:02Z","value":7,"labels":{"env":"canary"}},
+		{"id":"b3","service":"gw","name":"requests","at":"2026-10-01T10:00:50Z","value":60,"labels":{"env":"staging"}}
+	]}`
+	aggVisibilityQuery = "?name=requests&since=2026-10-01T10:00:00Z&until=2026-10-01T10:01:00Z&step=20"
+)
+
+// wantAggSeries is the expected shape of one series in an aggregate response;
+// env == "" means the series must omit labels.
+type wantAggSeries struct {
+	service string
+	env     string
+	counts  []int
+	deltas  []float64
+}
+
+func checkAggregateBody(t *testing.T, got []map[string]any, want []wantAggSeries) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("series count: got %d want %d (%v)", len(got), len(want), got)
+	}
+	for i, w := range want {
+		series := got[i]
+		if series["service"] != w.service {
+			t.Fatalf("series %d service: got %v want %s", i, series["service"], w.service)
+		}
+		labels, hasLabels := series["labels"].(map[string]any)
+		if w.env == "" {
+			if hasLabels {
+				t.Fatalf("series %d must omit labels: %v", i, series)
+			}
+		} else if !hasLabels || labels["env"] != w.env {
+			t.Fatalf("series %d labels: got %v want env=%s", i, series["labels"], w.env)
+		}
+		segments, ok := series["segments"].([]any)
+		if !ok || len(segments) != len(w.counts) {
+			t.Fatalf("series %d segments: %v", i, series["segments"])
+		}
+		for j, raw := range segments {
+			segment, ok := raw.(map[string]any)
+			if !ok {
+				t.Fatalf("series %d segment %d: %v", i, j, raw)
+			}
+			if int(number(segment["count"])) != w.counts[j] || segment["delta"].(float64) != w.deltas[j] {
+				t.Fatalf("series %d segment %d: got count=%v delta=%v, want %d/%v",
+					i, j, segment["count"], segment["delta"], w.counts[j], w.deltas[j])
+			}
+		}
+	}
+}
+
+// Series order is deterministic: service, then the canonical label set, whose
+// length-prefixed rendering sorts "prod" < "canary" < "staging" here.
+var (
+	aggVisibilityPreState = []wantAggSeries{
+		{service: "gw", env: "prod", counts: []int{1, 1, 0}, deltas: []float64{10, 10, 0}},
+		{service: "gw", env: "staging", counts: []int{1, 1, 0}, deltas: []float64{0, 5, 0}},
+	}
+	aggVisibilityPostState = []wantAggSeries{
+		// a4@09:59:55 (108) replaces a0 (100) as a1's predecessor: seg0 delta 2.
+		// a5 fills seg2. a3@10:01:00 stays excluded.
+		{service: "gw", env: "prod", counts: []int{1, 1, 1}, deltas: []float64{2, 10, 15}},
+		{service: "gw", env: "canary", counts: []int{1, 1, 0}, deltas: []float64{0, 2, 0}},
+		// b4@10:01:00 stays excluded; b3 fills seg2.
+		{service: "gw", env: "staging", counts: []int{1, 1, 1}, deltas: []float64{0, 5, 5}},
+	}
+)
+
+func TestGetMetricsAggregateCommittedBatchVisibility(t *testing.T) {
+	server := newMetricsServer(t, nil, nil)
+	postSamples(t, server, aggVisibilityPreBody)
+
+	status, out := aggregateGet(t, server, aggVisibilityQuery)
+	if status != http.StatusOK {
+		t.Fatalf("pre-state status %d: %v", status, out)
+	}
+	checkAggregateBody(t, out, aggVisibilityPreState)
+	segments := out[0]["segments"].([]any)
+	first := segments[0].(map[string]any)
+	last := segments[2].(map[string]any)
+	if first["since"] != "2026-10-01T10:00:00Z" || first["until"] != "2026-10-01T10:00:20Z" ||
+		last["since"] != "2026-10-01T10:00:40Z" || last["until"] != "2026-10-01T10:01:00Z" {
+		t.Fatalf("segment boundaries: %v", segments)
+	}
+
+	out2 := postSamples(t, server, aggVisibilityBatchBody)
+	if int(number(out2["created"])) != 6 || int(number(out2["replayed"])) != 0 {
+		t.Fatalf("batch ingest: %v", out2)
+	}
+
+	// After the commit succeeds, the same query shows the batch's full effect.
+	status, out = aggregateGet(t, server, aggVisibilityQuery)
+	if status != http.StatusOK {
+		t.Fatalf("post-state status %d: %v", status, out)
+	}
+	checkAggregateBody(t, out, aggVisibilityPostState)
+}
+
+// blockingMetricStorage blocks inside Append (the commit hook) once armed, so
+// a test can hold a batch mid-commit while queries run.
+type blockingMetricStorage struct {
+	mu      sync.Mutex
+	armed   bool
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (s *blockingMetricStorage) Append(batch []metrics.Sample) error {
+	s.mu.Lock()
+	armed := s.armed
+	s.mu.Unlock()
+	if armed {
+		close(s.entered)
+		<-s.release
+	}
+	return nil
+}
+
+func (s *blockingMetricStorage) Poisoned() bool { return false }
+
+func (s *blockingMetricStorage) arm() {
+	s.mu.Lock()
+	s.armed = true
+	s.mu.Unlock()
+}
+
+// fetchAggregate is a non-fatal aggregateGet for use inside goroutines.
+func fetchAggregate(server *httptest.Server, query string) (int, []map[string]any, error) {
+	resp, err := http.Get(server.URL + "/metrics/aggregate" + query)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, nil, err
+	}
+	var out []map[string]any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return resp.StatusCode, nil, err
+	}
+	return resp.StatusCode, out, nil
+}
+
+func TestGetMetricsAggregateConcurrentWithIngest(t *testing.T) {
+	storage := &blockingMetricStorage{entered: make(chan struct{}), release: make(chan struct{})}
+	server := newMetricsServer(t, metrics.NewStore(), storage)
+	postSamples(t, server, aggVisibilityPreBody)
+
+	status, preState, err := fetchAggregate(server, aggVisibilityQuery)
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("pre-state status %d err %v", status, err)
+	}
+	checkAggregateBody(t, preState, aggVisibilityPreState)
+
+	storage.arm()
+
+	// Commit the batch in the background; it blocks inside the commit hook.
+	postDone := make(chan int, 1)
+	go func() {
+		req, err := http.NewRequest(http.MethodPost, server.URL+"/metrics", strings.NewReader(aggVisibilityBatchBody))
+		if err != nil {
+			postDone <- 0
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			postDone <- 0
+			return
+		}
+		resp.Body.Close()
+		postDone <- resp.StatusCode
+	}()
+
+	// Queries racing the commit start may land on either side of it.
+	type aggResult struct {
+		status int
+		body   []map[string]any
+		err    error
+	}
+	const racingReaders = 3
+	racing := make(chan aggResult, racingReaders)
+	for i := 0; i < racingReaders; i++ {
+		go func() {
+			status, body, err := fetchAggregate(server, aggVisibilityQuery)
+			racing <- aggResult{status, body, err}
+		}()
+	}
+
+	<-storage.entered
+
+	// Queries issued while the commit is in flight may wait for it; waiting
+	// must not be an error, and no partial batch may leak into a response.
+	const waitingReaders = 6
+	waiting := make(chan aggResult, waitingReaders)
+	for i := 0; i < waitingReaders; i++ {
+		go func() {
+			status, body, err := fetchAggregate(server, aggVisibilityQuery)
+			waiting <- aggResult{status, body, err}
+		}()
+	}
+	select {
+	case r := <-waiting:
+		t.Fatalf("query returned while commit in flight: %d %v", r.status, r.body)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(storage.release)
+	if status := <-postDone; status != http.StatusOK {
+		t.Fatalf("batch POST status %d", status)
+	}
+
+	status, postState, err := fetchAggregate(server, aggVisibilityQuery)
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("post-state status %d err %v", status, err)
+	}
+	checkAggregateBody(t, postState, aggVisibilityPostState)
+
+	// Every racing response is exactly one of the two committed states.
+	for i := 0; i < racingReaders; i++ {
+		r := <-racing
+		if r.err != nil || r.status != http.StatusOK {
+			t.Fatalf("racing query: status %d err %v", r.status, r.err)
+		}
+		if !reflect.DeepEqual(r.body, preState) && !reflect.DeepEqual(r.body, postState) {
+			t.Fatalf("racing query saw a mixed state: %v", r.body)
+		}
+	}
+	// Every query that waited out the commit sees the complete new state.
+	for i := 0; i < waitingReaders; i++ {
+		select {
+		case r := <-waiting:
+			if r.err != nil || r.status != http.StatusOK {
+				t.Fatalf("waiting query: status %d err %v", r.status, r.err)
+			}
+			if !reflect.DeepEqual(r.body, postState) {
+				t.Fatalf("waiting query saw a mixed state: %v", r.body)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("query did not return after the commit was released")
+		}
+	}
+}
+
+func TestPostMetricsRejectedBatchLeavesAggregateUntouched(t *testing.T) {
+	server := newMetricsServer(t, nil, nil)
+	postSamples(t, server, aggVisibilityPreBody)
+
+	status, before := aggregateGet(t, server, aggVisibilityQuery)
+	if status != http.StatusOK {
+		t.Fatalf("baseline status %d: %v", status, before)
+	}
+
+	// Valid new samples plus one that claims an existing series' absolute
+	// instant under a different id: the whole batch is rejected.
+	rejected := `{"samples":[
+		{"id":"c1","service":"gw","name":"requests","at":"2026-10-01T10:00:02Z","value":7,"labels":{"env":"canary"}},
+		{"id":"a5","service":"gw","name":"requests","at":"2026-10-01T10:00:45Z","value":135,"labels":{"env":"prod"}},
+		{"id":"b3","service":"gw","name":"requests","at":"2026-10-01T10:00:50Z","value":60,"labels":{"env":"staging"}},
+		{"id":"clash","service":"gw","name":"requests","at":"2026-10-01T10:00:05Z","value":999,"labels":{"env":"prod"}}
+	]}`
+	status, out := metricsDo(t, server, http.MethodPost, "/metrics", rejected)
+	if status != http.StatusConflict {
+		t.Fatalf("clashing batch: want 409, got %d (%v)", status, out)
+	}
+	if out["error"] == "" {
+		t.Fatalf("conflict must carry an error message: %v", out)
+	}
+
+	status, after := aggregateGet(t, server, aggVisibilityQuery)
+	if status != http.StatusOK {
+		t.Fatalf("post-rejection status %d: %v", status, after)
+	}
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("rejected batch changed the aggregate:\nbefore %v\nafter  %v", before, after)
+	}
+
+	// The valid siblings were not stored: re-posting them creates them.
+	out = postSamples(t, server, `{"samples":[
+		{"id":"c1","service":"gw","name":"requests","at":"2026-10-01T10:00:02Z","value":7,"labels":{"env":"canary"}},
+		{"id":"a5","service":"gw","name":"requests","at":"2026-10-01T10:00:45Z","value":135,"labels":{"env":"prod"}},
+		{"id":"b3","service":"gw","name":"requests","at":"2026-10-01T10:00:50Z","value":60,"labels":{"env":"staging"}}
+	]}`)
+	if int(number(out["created"])) != 3 || int(number(out["replayed"])) != 0 {
+		t.Fatalf("valid siblings must not have been stored by the rejected batch: %v", out)
 	}
 }
