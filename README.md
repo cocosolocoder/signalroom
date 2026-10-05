@@ -58,11 +58,41 @@ taking precedence over conflict checks:
 
 - `200` — `{"created": <n>, "replayed": <m>}`, where `created` counts newly
   stored events and `replayed` counts retries identical to a stored event.
-- `400` — invalid JSON, unknown or duplicate fields, an empty array, or an
-  event failing validation. Nothing from the batch is written.
+- `400` — invalid JSON, unknown or duplicate fields, an empty array, an
+  event failing validation, or a batch whose **new** events save to more
+  than **64 MiB** (`1024*1024` bytes per MiB) in the storage format. Nothing
+  from the batch is written.
 - `409` — an id already stored with different content, or an id repeated
   within the batch. Nothing is changed.
-- `503` — storage has failed; this and later requests fail until restart.
+- `503` — a real storage write or sync has failed; this and later requests
+  fail until restart.
+
+#### Batch save capacity vs. storage failure
+
+The request body is capped at 16 MiB, but storage measures the bytes
+actually saved: the save format JSON-escapes content, so characters such as
+`<`, `>`, and `&` take more bytes on disk than in the request (an `&` is one
+request byte but six saved bytes). A legal, under-16-MiB body whose escaped
+content would exceed 64 MiB is rejected with `400` and a non-empty `error`
+that names the save capacity and asks for less content per submission. The
+64 MiB limit covers the saved content itself, not the surrounding record
+header; a batch encoding to exactly 64 MiB is accepted.
+
+This is a content limit, not a storage fault, so it behaves like any other
+`400`: the whole batch is refused (no event is partially saved, truncated,
+or stripped of labels), nothing is written to disk, the store keeps serving
+requests without a restart, and the rejected ids remain free for a smaller
+follow-up batch. Only brand-new events count toward the limit — identical
+retries are not saved again, so a batch mixing retries with new events is
+measured by the new events alone, and an all-retry batch returns the usual
+`{"created":0,"replayed":...}` regardless of how large the stored content
+is. The capacity check runs after field, label, and timestamp validation
+(`400`) and id conflict checks (`409`).
+
+By contrast, a genuine write or sync failure returns `503` and the process
+then refuses all event requests until it is restarted; a retry of the same
+content cannot help. If you see `400` mentioning the save capacity, split
+or shrink the batch; only `503` calls for a restart.
 
 Time equality uses absolute instants, so the same moment in different
 timezone offsets is treated as identical.

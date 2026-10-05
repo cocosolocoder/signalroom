@@ -153,6 +153,8 @@ func (h *Handler) postEvents(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case events.IsValidationError(err):
 			writeError(w, http.StatusBadRequest, err.Error())
+		case events.IsOversizeBatchError(err):
+			writeError(w, http.StatusBadRequest, err.Error())
 		case events.IsConflictError(err):
 			writeError(w, http.StatusConflict, err.Error())
 		default:

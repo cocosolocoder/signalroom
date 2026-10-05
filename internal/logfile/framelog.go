@@ -12,10 +12,18 @@ import (
 
 const (
 	headerSize = 8
-	// maxPayload guards against absurd allocations when a corrupt length
-	// prefix happens to point inside the file.
-	maxPayload = 64 << 20
+	// MaxPayloadBytes is the 64 MiB (1024*1024-byte units) capacity of one
+	// frame payload. It bounds the saved content itself, excluding the
+	// 8-byte frame header, and guards against absurd allocations when a
+	// corrupt length prefix happens to point inside the file.
+	MaxPayloadBytes = 64 << 20
 )
+
+// ErrPayloadTooLarge is returned when a frame's encoded content exceeds
+// MaxPayloadBytes. It describes the content, not a storage fault: the check
+// runs before anything is written or locked for mutation, the log is not
+// poisoned, and later writes keep working without a restart.
+var ErrPayloadTooLarge = errors.New("frame payload exceeds the 64 MiB save capacity")
 
 // ErrPoisoned is returned after a write or sync failure. The log refuses all
 // further writes until the process is restarted and recovery succeeds.
@@ -102,7 +110,7 @@ func replayFrames[T any](file *os.File, noun string, decode func(payload []byte)
 			break // torn partial header
 		}
 		payloadLen := int64(binary.BigEndian.Uint32(data[pos : pos+4]))
-		if payloadLen <= 0 || payloadLen > maxPayload {
+		if payloadLen <= 0 || payloadLen > MaxPayloadBytes {
 			return nil, 0, corruption("corrupt %s frame header at offset %d", noun, pos)
 		}
 		frameEnd := pos + headerSize + payloadLen
@@ -127,11 +135,11 @@ func replayFrames[T any](file *os.File, noun string, decode func(payload []byte)
 // appendFrame durably writes one already-encoded payload: the frame is
 // written and fsynced before the call returns. Any write or sync failure
 // poisons the log, so this call and every later one fail until restart. A
-// payload that fails the size check is rejected before the log is touched
-// and does not poison it.
+// payload that fails the size check returns ErrPayloadTooLarge before the
+// log is touched and does not poison it.
 func (l *frameLog) appendFrame(payload []byte) (err error) {
-	if len(payload) > maxPayload {
-		return fmt.Errorf("%s exceeds %d byte frame limit", l.unit, maxPayload)
+	if len(payload) > MaxPayloadBytes {
+		return fmt.Errorf("%w: %s is %d bytes", ErrPayloadTooLarge, l.unit, len(payload))
 	}
 
 	frame := make([]byte, headerSize+len(payload))

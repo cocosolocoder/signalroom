@@ -1,12 +1,22 @@
 package events
 
 import (
+	"errors"
+	"fmt"
 	"maps"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 )
+
+// MaxBatchPayloadBytes bounds what one save may hold in the on-disk save
+// format (MarshalBatch): 64 MiB in 1024*1024-byte units, matching the durable
+// frame capacity. It measures the encoded JSON content of the newly saved
+// events only — not any replayed events and not the surrounding frame
+// header. A batch encoding to exactly this size is still accepted; only a
+// larger encoding is rejected.
+const MaxBatchPayloadBytes = 64 << 20
 
 // BeforeCommit persists a batch of brand-new events. It runs while the
 // timeline lock is held and before the batch becomes visible to queries, so a
@@ -32,6 +42,28 @@ func NewTimeline() *Timeline {
 type IngestResult struct {
 	Created  int
 	Replayed int
+}
+
+// OversizeBatchError reports that the brand-new events of a batch encode to
+// more than MaxBatchPayloadBytes in the save format. It is a property of the
+// request content, not of the storage: nothing is written, the store stays
+// usable without a restart, the rejected ids remain free, and the same
+// events are accepted once submitted in smaller batches. Replayed events are
+// not part of the measured payload.
+type OversizeBatchError struct {
+	Size  int
+	Limit int
+}
+
+func (e *OversizeBatchError) Error() string {
+	return fmt.Sprintf("event batch saves to %d bytes, exceeding the %d byte save capacity; reduce the amount of content in a single submission", e.Size, e.Limit)
+}
+
+// IsOversizeBatchError reports whether err is a batch that exceeds the save
+// capacity, as opposed to a validation, conflict, or storage failure.
+func IsOversizeBatchError(err error) bool {
+	var target *OversizeBatchError
+	return errors.As(err, &target)
 }
 
 // Ingest normalizes and validates every event first, then checks the whole
@@ -75,7 +107,19 @@ func (t *Timeline) Ingest(batch []Event, beforeCommit BeforeCommit) (IngestResul
 		result.Created++
 	}
 
+	// Only brand-new events are saved, so only they count toward the save
+	// capacity: a batch made entirely (or partly) of identical retries is
+	// measured by what would actually be written. The check runs after
+	// validation and conflict checks but before beforeCommit, so an oversize
+	// batch neither touches durable storage nor marks the store unavailable.
 	if len(created) > 0 {
+		payload, err := MarshalBatch(created)
+		if err != nil {
+			return IngestResult{}, err
+		}
+		if len(payload) > MaxBatchPayloadBytes {
+			return IngestResult{}, &OversizeBatchError{Size: len(payload), Limit: MaxBatchPayloadBytes}
+		}
 		if beforeCommit != nil {
 			if err := beforeCommit(created); err != nil {
 				return IngestResult{}, err
