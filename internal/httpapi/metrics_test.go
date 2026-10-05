@@ -543,6 +543,253 @@ func TestGetMetricsAggregateNonFiniteDeltaIs422(t *testing.T) {
 	}
 }
 
+// windowCount runs an aggregate query expected to match exactly one series
+// and returns the number of samples in its segments. It is the queryable
+// evidence that ingestion stored (or did not store) a point.
+func windowCount(t *testing.T, server *httptest.Server, query string) int {
+	t.Helper()
+	status, out := aggregateGet(t, server, query)
+	if status != http.StatusOK || len(out) != 1 {
+		t.Fatalf("aggregate expected one series, got %d: %v", status, out)
+	}
+	total := 0
+	for _, seg := range out[0]["segments"].([]any) {
+		total += int(number(seg.(map[string]any)["count"]))
+	}
+	return total
+}
+
+const (
+	wideOldAt    = "1600-01-01T00:00:00Z"
+	wideOldAltTZ = "1600-01-01T08:00:00+08:00"
+	wideFutureAt = "2184-07-20T23:34:33.709551616Z"
+	// wideFutureAltTZ is the same absolute instant as wideFutureAt written
+	// with a seven-hour-behind offset.
+	wideFutureAltTZ  = "2184-07-20T16:34:33.709551616-07:00"
+	wideOldWindow    = "?name=wide&service=gw&since=1599-12-31T23:59:59Z&until=1600-01-01T00:00:01Z&step=2"
+	wideFutureWindow = "?name=wide&service=gw&since=2184-07-20T23:34:33Z&until=2184-07-20T23:34:34Z&step=1"
+)
+
+func TestPostMetricsWideDatePointsAccepted(t *testing.T) {
+	// These two instants are centuries apart but share one naive UnixNano
+	// value because the pre-1678 seconds overflow; both orders must ingest.
+	for _, reverse := range []bool{false, true} {
+		t.Run("order", func(t *testing.T) {
+			server := newMetricsServer(t, nil, nil)
+			body := `{"samples":[
+				{"id":"old","service":"gw","name":"wide","at":"` + wideOldAt + `","value":1},
+				{"id":"future","service":"gw","name":"wide","at":"` + wideFutureAt + `","value":2}
+			]}`
+			if reverse {
+				body = `{"samples":[
+					{"id":"future","service":"gw","name":"wide","at":"` + wideFutureAt + `","value":2},
+					{"id":"old","service":"gw","name":"wide","at":"` + wideOldAt + `","value":1}
+				]}`
+			}
+			out := postSamples(t, server, body)
+			if int(number(out["created"])) != 2 || int(number(out["replayed"])) != 0 {
+				t.Fatalf("wide pair must create two points (reverse=%v): %v", reverse, out)
+			}
+			if count := windowCount(t, server, wideOldWindow); count != 1 {
+				t.Fatalf("old-era short window must hold one point, got %d (reverse=%v)", count, reverse)
+			}
+			if count := windowCount(t, server, wideFutureWindow); count != 1 {
+				t.Fatalf("future-era short window must hold one point, got %d (reverse=%v)", count, reverse)
+			}
+
+			// Resubmitting both with the same ids/contents replays both, even
+			// across the centuries: created stays zero and counts are unchanged.
+			out = postSamples(t, server, body)
+			if int(number(out["created"])) != 0 || int(number(out["replayed"])) != 2 {
+				t.Fatalf("identical wide batch must replay (reverse=%v): %v", reverse, out)
+			}
+			if count := windowCount(t, server, wideOldWindow); count != 1 {
+				t.Fatalf("replay changed old-era count: %d", count)
+			}
+			if count := windowCount(t, server, wideFutureWindow); count != 1 {
+				t.Fatalf("replay changed future-era count: %d", count)
+			}
+		})
+	}
+}
+
+func TestPostMetricsPost2262DateAccepted(t *testing.T) {
+	// A legal date past the UnixNano-safe year 2262 must not be bounded out.
+	server := newMetricsServer(t, nil, nil)
+	out := postSamples(t, server, `{"samples":[
+		{"id":"far","service":"gw","name":"wide","at":"2300-01-02T03:04:05.678901234Z","value":9}
+	]}`)
+	if int(number(out["created"])) != 1 || int(number(out["replayed"])) != 0 {
+		t.Fatalf("post-2262 sample: %v", out)
+	}
+	query := "?name=wide&service=gw&since=2300-01-02T03:04:05Z&until=2300-01-02T03:04:06Z&step=1"
+	if count := windowCount(t, server, query); count != 1 {
+		t.Fatalf("post-2262 point must be queryable, got %d", count)
+	}
+}
+
+func TestPostMetricsWideDateTimezoneClashes(t *testing.T) {
+	server := newMetricsServer(t, nil, nil)
+	postSamples(t, server, `{"samples":[
+		{"id":"owner","service":"gw","name":"wide","at":"`+wideOldAt+`","value":1}
+	]}`)
+
+	// A different id occupying the same series/instant in another timezone
+	// spelling clashes with the already-accepted point.
+	status, out := metricsDo(t, server, http.MethodPost, "/metrics", `{"samples":[
+		{"id":"intruder","service":"gw","name":"wide","at":"`+wideOldAltTZ+`","value":7}
+	]}`)
+	if status != http.StatusConflict || out["error"] == "" {
+		t.Fatalf("timezone-equivalent clash against stored point must be 409 with error, got %d %v", status, out)
+	}
+
+	// The same clash entirely inside one batch is also refused.
+	status, out = metricsDo(t, server, http.MethodPost, "/metrics", `{"samples":[
+		{"id":"f1","service":"gw","name":"wide","at":"`+wideFutureAt+`","value":1},
+		{"id":"f2","service":"gw","name":"wide","at":"`+wideFutureAltTZ+`","value":2}
+	]}`)
+	if status != http.StatusConflict || out["error"] == "" {
+		t.Fatalf("in-batch timezone clash must be 409 with error, got %d %v", status, out)
+	}
+
+	// Nothing from either rejection became visible: old window still 1, the
+	// future window still has no series.
+	if count := windowCount(t, server, wideOldWindow); count != 1 {
+		t.Fatalf("rejections must not add points, old window count=%d", count)
+	}
+	if status, agg := aggregateGet(t, server, wideFutureWindow); status != http.StatusOK || len(agg) != 0 {
+		t.Fatalf("rejected future batch must be absent, got %d %v", status, agg)
+	}
+}
+
+func TestPostMetricsWideDateReplayAndNanosecondMove(t *testing.T) {
+	server := newMetricsServer(t, nil, nil)
+	postSamples(t, server, `{"samples":[
+		{"id":"r","service":"gw","name":"wide","at":"`+wideFutureAt+`","value":3}
+	]}`)
+
+	// Same id, identical content, only the timezone representation changed:
+	// one replay and no new sample.
+	out := postSamples(t, server, `{"samples":[
+		{"id":"r","service":"gw","name":"wide","at":"`+wideFutureAltTZ+`","value":3}
+	]}`)
+	if int(number(out["created"])) != 0 || int(number(out["replayed"])) != 1 {
+		t.Fatalf("timezone-only resubmission must replay one: %v", out)
+	}
+	if count := windowCount(t, server, wideFutureWindow); count != 1 {
+		t.Fatalf("replay must not add a sample, count=%d", count)
+	}
+
+	// The same id whose instant really moves, even by one nanosecond, is a
+	// conflict rather than a replay.
+	for _, moved := range []string{
+		"2184-07-20T23:34:33.709551617Z",
+		"2184-07-20T23:34:33.709551615Z",
+	} {
+		status, out := metricsDo(t, server, http.MethodPost, "/metrics", `{"samples":[
+			{"id":"r","service":"gw","name":"wide","at":"`+moved+`","value":3}
+		]}`)
+		if status != http.StatusConflict || out["error"] == "" {
+			t.Fatalf("one-nanosecond move for %s must be 409 with error, got %d %v", moved, status, out)
+		}
+	}
+	if count := windowCount(t, server, wideFutureWindow); count != 1 {
+		t.Fatalf("failed moves must not add samples, count=%d", count)
+	}
+}
+
+func TestPostMetricsWideDateMixedBatchRollsBack(t *testing.T) {
+	server := newMetricsServer(t, nil, nil)
+	postSamples(t, server, `{"samples":[
+		{"id":"owner","service":"gw","name":"wide","at":"`+wideOldAt+`","value":1}
+	]}`)
+
+	// One conflicting sample plus one legal new sample: the whole batch is
+	// rejected, leaving no trace of the legal sample.
+	status, out := metricsDo(t, server, http.MethodPost, "/metrics", `{"samples":[
+		{"id":"intruder","service":"gw","name":"wide","at":"`+wideOldAltTZ+`","value":9},
+		{"id":"fresh","service":"gw","name":"wide","at":"`+wideFutureAt+`","value":2}
+	]}`)
+	if status != http.StatusConflict || out["error"] == "" {
+		t.Fatalf("mixed batch must be 409 with error, got %d %v", status, out)
+	}
+	if count := windowCount(t, server, wideOldWindow); count != 1 {
+		t.Fatalf("old window must be unchanged after rollback, count=%d", count)
+	}
+	if status, agg := aggregateGet(t, server, wideFutureWindow); status != http.StatusOK || len(agg) != 0 {
+		t.Fatalf("legal sample must not survive the rollback, got %d %v", status, agg)
+	}
+
+	// The legal new sample submitted by itself is genuinely new.
+	out = postSamples(t, server, `{"samples":[
+		{"id":"fresh","service":"gw","name":"wide","at":"`+wideFutureAt+`","value":2}
+	]}`)
+	if int(number(out["created"])) != 1 || int(number(out["replayed"])) != 0 {
+		t.Fatalf("standalone legal sample must create one: %v", out)
+	}
+	if count := windowCount(t, server, wideFutureWindow); count != 1 {
+		t.Fatalf("future window must hold the separately ingested point, count=%d", count)
+	}
+}
+
+func TestPostMetricsNanosecondApartPointsCoexist(t *testing.T) {
+	for _, reverse := range []bool{false, true} {
+		t.Run("order", func(t *testing.T) {
+			server := newMetricsServer(t, nil, nil)
+			body := `{"samples":[
+				{"id":"n0","service":"gw","name":"wide","at":"2026-10-01T10:00:00.123456789Z","value":1},
+				{"id":"n1","service":"gw","name":"wide","at":"2026-10-01T10:00:00.123456790Z","value":2}
+			]}`
+			if reverse {
+				body = `{"samples":[
+					{"id":"n1","service":"gw","name":"wide","at":"2026-10-01T10:00:00.123456790Z","value":2},
+					{"id":"n0","service":"gw","name":"wide","at":"2026-10-01T10:00:00.123456789Z","value":1}
+				]}`
+			}
+			out := postSamples(t, server, body)
+			if int(number(out["created"])) != 2 || int(number(out["replayed"])) != 0 {
+				t.Fatalf("nanosecond-apart samples must both create (reverse=%v): %v", reverse, out)
+			}
+			query := "?name=wide&service=gw&since=2026-10-01T10:00:00Z&until=2026-10-01T10:00:01Z&step=1"
+			if count := windowCount(t, server, query); count != 2 {
+				t.Fatalf("one-second window must contain both points, got %d (reverse=%v)", count, reverse)
+			}
+		})
+	}
+}
+
+func TestPostMetricsWideDateClashScopedToLabelSet(t *testing.T) {
+	server := newMetricsServer(t, nil, nil)
+	// Two series distinguished only by labels may each hold the same distant
+	// instant.
+	out := postSamples(t, server, `{"samples":[
+		{"id":"p1","service":"gw","name":"wide","at":"`+wideOldAt+`","value":1,"labels":{"env":"prod"}},
+		{"id":"s1","service":"gw","name":"wide","at":"`+wideOldAt+`","value":1,"labels":{"env":"staging"}}
+	]}`)
+	if int(number(out["created"])) != 2 {
+		t.Fatalf("distinct label sets share an instant: %v", out)
+	}
+
+	// Another id on either label set at that instant still clashes.
+	for _, label := range []string{"prod", "staging"} {
+		status, out := metricsDo(t, server, http.MethodPost, "/metrics", `{"samples":[
+			{"id":"other-`+label+`","service":"gw","name":"wide","at":"`+wideOldAltTZ+`","value":2,"labels":{"env":"`+label+`"}}
+		]}`)
+		if status != http.StatusConflict || out["error"] == "" {
+			t.Fatalf("env=%s clash must be 409 with error, got %d %v", label, status, out)
+		}
+	}
+
+	// Each label series is independently queryable at the shared instant.
+	for _, label := range []string{"prod", "staging"} {
+		query := "?name=wide&service=gw&label=env=" + label +
+			"&since=1599-12-31T23:59:59Z&until=1600-01-01T00:00:01Z&step=2"
+		if count := windowCount(t, server, query); count != 1 {
+			t.Fatalf("env=%s series must hold one point, got %d", label, count)
+		}
+	}
+}
+
 func TestGetMetricsAggregateServiceAndLabelFilters(t *testing.T) {
 	server := newMetricsServer(t, nil, nil)
 	postSamples(t, server, `{"samples":[
