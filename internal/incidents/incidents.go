@@ -393,23 +393,8 @@ func (r *Registry) checkAction(state *incidentState, req Request) error {
 			return conflictErr(state.version, "cannot add a note to a %s incident", state.status)
 		}
 	case ActionLinkEvent:
-		if state.status != StatusOpen {
-			return conflictErr(state.version, "cannot link an event to a %s incident", state.status)
-		}
-		if r.events == nil {
-			return notFoundErr("event %q not found", req.Content)
-		}
-		service, found := r.events.LookupEvent(req.Content)
-		if !found {
-			return notFoundErr("event %q not found", req.Content)
-		}
-		if service != state.service {
-			return conflictErr(state.version,
-				"event %q belongs to service %q, not %q", req.Content, service, state.service)
-		}
-		if _, linked := state.linkSet[req.Content]; linked {
-			return conflictErr(state.version,
-				"event %q is already linked to incident %q", req.Content, state.id)
+		if err := r.linkConflictError(state, req, r.checkLinkEligibility(state, req.Content)); err != nil {
+			return err
 		}
 	case ActionResolve:
 		if state.status != StatusOpen {
@@ -423,6 +408,81 @@ func (r *Registry) checkAction(state *incidentState, req Request) error {
 		if err := personnelConflictError(state, req); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// linkViolation identifies one broken link rule without binding it to an
+// error vocabulary: the live request path turns it into a 404/409, while
+// startup replay turns it into a log inconsistency. Keeping the judgment
+// independent of the wording means both entry paths enforce the very same
+// link constraints.
+type linkViolation int
+
+const (
+	linkOK linkViolation = iota
+	// linkClosed: a link was attempted while the incident was not open.
+	linkClosed
+	// linkEventMissing: the event id does not resolve in the event log.
+	linkEventMissing
+	// linkWrongService: the event belongs to another service.
+	linkWrongService
+	// linkAlreadyLinked: the incident already links the event.
+	linkAlreadyLinked
+)
+
+// linkEligibility is the outcome of a link check. Service is the resolved
+// event service, populated for linkWrongService so a renderer never has to
+// query the event log a second time.
+type linkEligibility struct {
+	violation linkViolation
+	service   string
+}
+
+// checkLinkEligibility evaluates the link rules shared by the live request
+// path and startup replay: a link is accepted only while the incident is
+// open; the event must already be ingested; it must belong to the incident's
+// service; and the incident must not already link it. The rule order is the
+// precedence both paths report in: a closed incident conflicts even when the
+// event is also missing, a missing event is reported before service or
+// duplication problems.
+func (r *Registry) checkLinkEligibility(state *incidentState, eventID string) linkEligibility {
+	if state.status != StatusOpen {
+		return linkEligibility{violation: linkClosed}
+	}
+	if r.events == nil {
+		return linkEligibility{violation: linkEventMissing}
+	}
+	service, found := r.events.LookupEvent(eventID)
+	if !found {
+		return linkEligibility{violation: linkEventMissing}
+	}
+	if service != state.service {
+		return linkEligibility{violation: linkWrongService, service: service}
+	}
+	if _, linked := state.linkSet[eventID]; linked {
+		return linkEligibility{violation: linkAlreadyLinked}
+	}
+	return linkEligibility{violation: linkOK}
+}
+
+// linkConflictError renders a shared link violation in the live request
+// path's vocabulary: a missing event is a 404-style not-found; every other
+// violation is a 409-style conflict carrying the current version.
+func (r *Registry) linkConflictError(state *incidentState, req Request, result linkEligibility) error {
+	switch result.violation {
+	case linkOK:
+		return nil
+	case linkClosed:
+		return conflictErr(state.version, "cannot link an event to a %s incident", state.status)
+	case linkEventMissing:
+		return notFoundErr("event %q not found", req.Content)
+	case linkWrongService:
+		return conflictErr(state.version,
+			"event %q belongs to service %q, not %q", req.Content, result.service, state.service)
+	case linkAlreadyLinked:
+		return conflictErr(state.version,
+			"event %q is already linked to incident %q", req.Content, state.id)
 	}
 	return nil
 }
