@@ -393,23 +393,8 @@ func (r *Registry) checkAction(state *incidentState, req Request) error {
 			return conflictErr(state.version, "cannot add a note to a %s incident", state.status)
 		}
 	case ActionLinkEvent:
-		if state.status != StatusOpen {
-			return conflictErr(state.version, "cannot link an event to a %s incident", state.status)
-		}
-		if r.events == nil {
-			return notFoundErr("event %q not found", req.Content)
-		}
-		service, found := r.events.LookupEvent(req.Content)
-		if !found {
-			return notFoundErr("event %q not found", req.Content)
-		}
-		if service != state.service {
-			return conflictErr(state.version,
-				"event %q belongs to service %q, not %q", req.Content, service, state.service)
-		}
-		if _, linked := state.linkSet[req.Content]; linked {
-			return conflictErr(state.version,
-				"event %q is already linked to incident %q", req.Content, state.id)
+		if err := r.linkConflictError(state, req); err != nil {
+			return err
 		}
 	case ActionResolve:
 		if state.status != StatusOpen {
@@ -423,6 +408,74 @@ func (r *Registry) checkAction(state *incidentState, req Request) error {
 		if err := personnelConflictError(state, req); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// linkViolation identifies one broken link_event eligibility rule without
+// binding it to an error vocabulary: the live request path turns it into a
+// 404/409 in its own wording, while startup replay turns it into a log
+// inconsistency. Keeping the judgment independent of the wording means both
+// entry paths enforce the very same business constraints.
+type linkViolation int
+
+const (
+	linkOK linkViolation = iota
+	// linkClosed: a link was attempted while the incident was not open.
+	linkClosed
+	// linkMissing: the event id does not resolve in the event log (or there
+	// is no event lookup at all).
+	linkMissing
+	// linkWrongService: the event belongs to a different service.
+	linkWrongService
+	// linkAlreadyLinked: the incident already links this event.
+	linkAlreadyLinked
+)
+
+// checkLinkEligibility evaluates the link rules shared by the live request
+// path and startup replay: an event may be linked only while the incident is
+// open, only when it exists and belongs to the incident's service, and only
+// once per incident. It needs the registry solely to resolve events; every
+// other input comes from the in-progress state and the normalized request.
+// The returned service is the resolved event's service when the event was
+// found, so the callers never have to look it up a second time.
+func (r *Registry) checkLinkEligibility(state *incidentState, req Request) (linkViolation, string) {
+	if state.status != StatusOpen {
+		return linkClosed, ""
+	}
+	if r.events == nil {
+		return linkMissing, ""
+	}
+	service, found := r.events.LookupEvent(req.Content)
+	if !found {
+		return linkMissing, ""
+	}
+	if service != state.service {
+		return linkWrongService, service
+	}
+	if _, linked := state.linkSet[req.Content]; linked {
+		return linkAlreadyLinked, service
+	}
+	return linkOK, service
+}
+
+// linkConflictError renders a shared link violation in the live request
+// path's vocabulary: a missing event is a 404, every other violation is a
+// 409-style conflict carrying the current version.
+func (r *Registry) linkConflictError(state *incidentState, req Request) error {
+	switch violation, service := r.checkLinkEligibility(state, req); violation {
+	case linkOK:
+		return nil
+	case linkClosed:
+		return conflictErr(state.version, "cannot link an event to a %s incident", state.status)
+	case linkMissing:
+		return notFoundErr("event %q not found", req.Content)
+	case linkWrongService:
+		return conflictErr(state.version,
+			"event %q belongs to service %q, not %q", req.Content, service, state.service)
+	case linkAlreadyLinked:
+		return conflictErr(state.version,
+			"event %q is already linked to incident %q", req.Content, state.id)
 	}
 	return nil
 }

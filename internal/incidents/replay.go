@@ -48,10 +48,12 @@ func (r *Registry) Load(record Record) error {
 	}
 }
 
-// checkLoadedAction mirrors the live state-machine and link checks. Events
-// are never removed, so an event linked at action time must still resolve and
-// still match the incident's service; a failure means the log is internally
-// inconsistent and must abort startup rather than mutate data.
+// checkLoadedAction re-runs the live state-machine and link checks, routing
+// the link and personnel rules through the same judgments the request path
+// uses. Events are never removed, so an event linked at action time must
+// still resolve and still match the incident's service; a failure means the
+// log is internally inconsistent and must abort startup rather than mutate
+// data.
 func (r *Registry) checkLoadedAction(state *incidentState, req Request) error {
 	switch req.Type {
 	case ActionNote:
@@ -59,22 +61,8 @@ func (r *Registry) checkLoadedAction(state *incidentState, req Request) error {
 			return validationErr("note action %q on %s incident in log", req.ActionID, state.status)
 		}
 	case ActionLinkEvent:
-		if state.status != StatusOpen {
-			return validationErr("link action %q on %s incident in log", req.ActionID, state.status)
-		}
-		if _, linked := state.linkSet[req.Content]; linked {
-			return validationErr("event %q linked twice in incident %q log", req.Content, state.id)
-		}
-		if r.events == nil {
-			return validationErr("event %q missing while replaying incident log", req.Content)
-		}
-		service, found := r.events.LookupEvent(req.Content)
-		if !found {
-			return validationErr("linked event %q no longer exists in the event log", req.Content)
-		}
-		if service != state.service {
-			return validationErr("linked event %q service %q does not match incident %q service %q",
-				req.Content, service, state.id, state.service)
+		if err := r.loadedLinkError(state, req); err != nil {
+			return err
 		}
 	case ActionResolve:
 		if state.status != StatusOpen {
@@ -88,6 +76,31 @@ func (r *Registry) checkLoadedAction(state *incidentState, req Request) error {
 		return checkLoadedPersonnelAction(state, req)
 	default:
 		return validationErr("unknown action %q in log", req.Type)
+	}
+	return nil
+}
+
+// loadedLinkError re-runs the shared link rules while replaying a durable
+// record. A violation means the log contradicts the rules the live path
+// enforced at commit time, so startup fails without mutating data. The
+// wording stays replay-specific ("in log"); the constraints themselves are
+// checkLinkEligibility's, the single place both paths maintain.
+func (r *Registry) loadedLinkError(state *incidentState, req Request) error {
+	switch violation, service := r.checkLinkEligibility(state, req); violation {
+	case linkOK:
+		return nil
+	case linkClosed:
+		return validationErr("link action %q on %s incident in log", req.ActionID, state.status)
+	case linkMissing:
+		if r.events == nil {
+			return validationErr("event %q missing while replaying incident log", req.Content)
+		}
+		return validationErr("linked event %q no longer exists in the event log", req.Content)
+	case linkWrongService:
+		return validationErr("linked event %q service %q does not match incident %q service %q",
+			req.Content, service, state.id, state.service)
+	case linkAlreadyLinked:
+		return validationErr("event %q linked twice in incident %q log", req.Content, state.id)
 	}
 	return nil
 }

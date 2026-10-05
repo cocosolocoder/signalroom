@@ -183,4 +183,32 @@ func TestReplayRejectsInconsistentLog(t *testing.T) {
 			t.Fatal("link to a vanished event must fail recovery")
 		}
 	})
+	t.Run("link on resolved incident", func(t *testing.T) {
+		reg := base()
+		_ = load(t, reg, creation(t0))
+		resolve := NewActionRecord(Request{IncidentID: "I1", ActionID: "r", Operator: "o", ExpectedVersion: 1, Type: ActionResolve, Content: "done"}, t0.Add(time.Second))
+		if err := reg.Load(resolve); err != nil {
+			t.Fatal(err)
+		}
+		// Sequentially valid (expected_version 2 is current) but the incident
+		// is resolved: the shared link eligibility check must reject it.
+		link := NewActionRecord(Request{IncidentID: "I1", ActionID: "l", Operator: "o", ExpectedVersion: 2, Type: ActionLinkEvent, Content: "e1"}, t0.Add(2*time.Second))
+		if err := reg.Load(link); err == nil {
+			t.Fatal("a link on a resolved incident must fail recovery")
+		}
+	})
+	t.Run("linked event twice", func(t *testing.T) {
+		reg := base()
+		_ = load(t, reg, creation(t0))
+		first := NewActionRecord(Request{IncidentID: "I1", ActionID: "l1", Operator: "o", ExpectedVersion: 1, Type: ActionLinkEvent, Content: "e1"}, t0.Add(time.Second))
+		if err := reg.Load(first); err != nil {
+			t.Fatal(err)
+		}
+		// A fresh action id and the right expected version, but the event is
+		// already linked to this incident.
+		again := NewActionRecord(Request{IncidentID: "I1", ActionID: "l2", Operator: "o", ExpectedVersion: 2, Type: ActionLinkEvent, Content: "e1"}, t0.Add(2*time.Second))
+		if err := reg.Load(again); err == nil {
+			t.Fatal("linking the same event twice must fail recovery")
+		}
+	})
 }

@@ -490,3 +490,109 @@ func TestConcurrentDistinctActionsSerialize(t *testing.T) {
 		t.Fatalf("all %d distinct actions should commit, version=%d", n, inc.Version)
 	}
 }
+
+// A stale expected_version must be reported before the missing event is even
+// looked up: when both a version conflict and a missing event apply, the
+// conflict wins and still carries the current version.
+func TestLinkVersionConflictPrecedesMissingEvent(t *testing.T) {
+	reg, commit, _ := newTestRegistry(&fakeEvents{}) // resolves no events
+	_, _ = reg.Create(validCreation())
+
+	_, err := reg.Apply(Request{IncidentID: "INC-1", ActionID: "l0", Operator: "b",
+		ExpectedVersion: 99, Type: ActionLinkEvent, Content: "ghost"})
+	if !IsConflictError(err) || CurrentVersionOf(err) != 1 {
+		t.Fatalf("stale version must win over the missing event, got %v", err)
+	}
+	if IsNotFoundError(err) {
+		t.Fatalf("missing event must not be reported first: %v", err)
+	}
+	inc, _ := reg.Get("INC-1")
+	if inc.Version != 1 || len(inc.Links) != 0 || len(inc.History) != 1 {
+		t.Fatalf("rejected link must change nothing: %+v", inc)
+	}
+	if commit.count() != 1 {
+		t.Fatalf("rejected link must not persist, count=%d", commit.count())
+	}
+}
+
+// Linking into a resolved incident is a state conflict even when the event
+// does not exist: the open/resolved gate precedes event existence.
+func TestLinkResolvedStatusPrecedesMissingEvent(t *testing.T) {
+	lookup := &fakeEvents{} // the linked event id never resolves
+	reg, commit, _ := newTestRegistry(lookup)
+	_, _ = reg.Create(validCreation())
+	if _, err := reg.Apply(Request{IncidentID: "INC-1", ActionID: "r1", Operator: "b",
+		ExpectedVersion: 1, Type: ActionResolve, Content: "done"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// expected_version matches (2), so only the resolved state and the
+	// missing event are in play; the state conflict must be reported.
+	_, err := reg.Apply(Request{IncidentID: "INC-1", ActionID: "l1", Operator: "b",
+		ExpectedVersion: 2, Type: ActionLinkEvent, Content: "ghost"})
+	if !IsConflictError(err) || CurrentVersionOf(err) != 2 {
+		t.Fatalf("resolved status must win over the missing event, got %v", err)
+	}
+	if IsNotFoundError(err) {
+		t.Fatalf("missing event must not be reported on a resolved incident: %v", err)
+	}
+	inc, _ := reg.Get("INC-1")
+	if inc.Status != StatusResolved || inc.Version != 2 || len(inc.Links) != 0 {
+		t.Fatalf("rejected link must change nothing: %+v", inc)
+	}
+	if commit.count() != 2 { // create + resolve only
+		t.Fatalf("rejected link must not persist, count=%d", commit.count())
+	}
+}
+
+// A committed link replays idempotently even after the incident has moved on
+// and resolved: the first result comes back verbatim and nothing is added.
+func TestLinkIdempotentReplayAcrossResolution(t *testing.T) {
+	lookup := &fakeEvents{services: map[string]string{"e1": "gateway", "e2": "gateway"}}
+	reg, commit, _ := newTestRegistry(lookup)
+	_, _ = reg.Create(validCreation())
+
+	first := Request{IncidentID: "INC-1", ActionID: "l1", Operator: "bob",
+		ExpectedVersion: 1, Type: ActionLinkEvent, Content: "e1"}
+	res, err := reg.Apply(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res != (ActionResult{IncidentID: "INC-1", ActionID: "l1", Version: 2}) {
+		t.Fatalf("first link result %+v", res)
+	}
+	if _, err := reg.Apply(Request{IncidentID: "INC-1", ActionID: "r1", Operator: "bob",
+		ExpectedVersion: 2, Type: ActionResolve, Content: "done"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Same action id and same normalized content, now stale and resolved:
+	// still the first result, still no extra link or history entry.
+	replay, err := reg.Apply(first)
+	if err != nil {
+		t.Fatalf("replay after resolution: %v", err)
+	}
+	if replay != res {
+		t.Fatalf("replay %+v want %+v", replay, res)
+	}
+	inc, _ := reg.Get("INC-1")
+	if inc.Version != 3 || len(inc.History) != 3 || len(inc.Links) != 1 {
+		t.Fatalf("replay must add nothing: %+v", inc)
+	}
+	if inc.Links[0] != "e1" {
+		t.Fatalf("links must be untouched: %+v", inc.Links)
+	}
+	if commit.count() != 3 { // create + link + resolve
+		t.Fatalf("replay must not persist, count=%d", commit.count())
+	}
+
+	// The same action id with changed content stays a conflict.
+	_, err = reg.Apply(Request{IncidentID: "INC-1", ActionID: "l1", Operator: "bob",
+		ExpectedVersion: 3, Type: ActionLinkEvent, Content: "e2"})
+	if !IsConflictError(err) {
+		t.Fatalf("changed link content: want conflict, got %v", err)
+	}
+	if got := CurrentVersionOf(err); got != 3 {
+		t.Fatalf("changed-content conflict reports version %d, want 3", got)
+	}
+}
