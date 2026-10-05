@@ -10,6 +10,7 @@ import (
 
 	"github.com/cocosolocoder/signalroom/internal/events"
 	"github.com/cocosolocoder/signalroom/internal/incidents"
+	"github.com/cocosolocoder/signalroom/internal/logfile"
 	"github.com/cocosolocoder/signalroom/internal/metrics"
 )
 
@@ -155,6 +156,10 @@ func (h *Handler) postEvents(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err.Error())
 		case events.IsConflictError(err):
 			writeError(w, http.StatusConflict, err.Error())
+		case logfile.IsOversize(err):
+			// The encoded batch is too large to save, but storage itself is
+			// healthy: reject the submission, do not mention a restart.
+			writeError(w, http.StatusBadRequest, "event batch exceeds the 64 MiB storage capacity; reduce the content of a single submission")
 		default:
 			writeError(w, http.StatusServiceUnavailable, "event storage is unavailable; restart required")
 		}

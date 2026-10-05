@@ -54,15 +54,34 @@ the same labels (order and surrounding whitespace are irrelevant), otherwise
 it is a `409` conflict.
 
 The whole batch is accepted or rejected together, with input validation
-taking precedence over conflict checks:
+taking precedence over conflict checks, and both taking precedence over the
+save-capacity check:
 
 - `200` — `{"created": <n>, "replayed": <m>}`, where `created` counts newly
   stored events and `replayed` counts retries identical to a stored event.
-- `400` — invalid JSON, unknown or duplicate fields, an empty array, or an
-  event failing validation. Nothing from the batch is written.
+- `400` — invalid JSON, unknown or duplicate fields, an empty array, an
+  event failing validation, or a batch whose new events exceed the save
+  capacity described below. Nothing from the batch is written.
 - `409` — an id already stored with different content, or an id repeated
   within the batch. Nothing is changed.
 - `503` — storage has failed; this and later requests fail until restart.
+
+Each batch is saved as one record whose encoded content may be at most
+64 MiB (64 × 1024 × 1024 bytes, not counting the record header); a batch
+encoded to exactly 64 MiB is still accepted. Only the batch's new events
+count toward this capacity — identical retries of already-stored events are
+not saved again and add nothing. The capacity is measured on the saved
+encoding, which can be larger than the request body: `<`, `>`, and `&` are
+each saved as a 6-byte escape, so a body within the 16 MiB request limit can
+still exceed the capacity.
+
+An over-capacity batch is rejected with `400` and nothing is written. This
+is a content-size problem, not a storage failure: reduce the content of a
+single submission (fewer or smaller events) and resubmit — storage stays
+usable, no restart is needed or helpful, and the rejected event ids remain
+free to use. A `503`, by contrast, means storage itself has failed; event
+requests then keep failing until the process is restarted, and shrinking the
+batch does not help.
 
 Time equality uses absolute instants, so the same moment in different
 timezone offsets is treated as identical.

@@ -221,6 +221,54 @@ func TestReplayFailsOnCompleteIllegalFrame(t *testing.T) {
 	}
 }
 
+func TestAppendOversizeBatchRejectedWithoutPoisoning(t *testing.T) {
+	dir := t.TempDir()
+	base := time.Date(2026, 10, 1, 9, 0, 0, 0, time.UTC)
+
+	log, _, err := Open(dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	// A plain maxPayload-byte message encodes past the payload limit once the
+	// record fields are added.
+	big := testEvent("big", base)
+	big.Message = strings.Repeat("x", maxPayload)
+	err = log.Append([]events.Event{big})
+	if !IsOversize(err) {
+		t.Fatalf("oversize batch must return an OversizeError, got %v", err)
+	}
+	if log.Poisoned() {
+		t.Fatal("oversize rejection is a content problem and must not poison the log")
+	}
+
+	// Exactly at the limit is accepted: size the message so the encoded
+	// payload is precisely maxPayload bytes ('x' needs no JSON escaping).
+	exact := testEvent("exact", base.Add(time.Second))
+	exact.Message = ""
+	encoded, _ := events.MarshalBatch([]events.Event{exact})
+	exact.Message = strings.Repeat("x", maxPayload-len(encoded))
+	if payload, _ := events.MarshalBatch([]events.Event{exact}); len(payload) != maxPayload {
+		t.Fatalf("test setup: payload is %d bytes, want exactly %d", len(payload), maxPayload)
+	}
+	if err := log.Append([]events.Event{exact}); err != nil {
+		t.Fatalf("batch exactly at the limit must be accepted: %v", err)
+	}
+	if err := log.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// Only the in-limit batch was ever written.
+	log2, batches, err := Open(dir)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer log2.Close()
+	if len(batches) != 1 || len(batches[0]) != 1 || batches[0][0].ID != "exact" {
+		t.Fatalf("rejected batch must leave no record behind: %+v", batches)
+	}
+}
+
 func TestAppendFailurePoisonsLog(t *testing.T) {
 	dir := t.TempDir()
 	base := time.Date(2026, 10, 1, 9, 0, 0, 0, time.UTC)

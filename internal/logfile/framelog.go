@@ -21,6 +21,26 @@ const (
 // further writes until the process is restarted and recovery succeeds.
 var ErrPoisoned = errors.New("log is unavailable after a storage failure")
 
+// OversizeError reports a payload that exceeds the frame payload limit. It
+// marks a content-size problem in the submitted batch, not a storage
+// failure: the log is left untouched and stays usable for later writes
+// within the limit.
+type OversizeError struct {
+	Unit  string // what one frame holds, e.g. "batch"
+	Size  int    // encoded payload bytes
+	Limit int    // maximum payload bytes per frame
+}
+
+func (e *OversizeError) Error() string {
+	return fmt.Sprintf("%s of %d bytes exceeds the %d byte storage capacity", e.Unit, e.Size, e.Limit)
+}
+
+// IsOversize reports whether err is an OversizeError.
+func IsOversize(err error) bool {
+	var target *OversizeError
+	return errors.As(err, &target)
+}
+
 // CorruptionError marks a complete frame that fails its checksum or contains
 // illegal data, as opposed to an incomplete trailing frame.
 type CorruptionError struct{ Reason string }
@@ -127,11 +147,11 @@ func replayFrames[T any](file *os.File, noun string, decode func(payload []byte)
 // appendFrame durably writes one already-encoded payload: the frame is
 // written and fsynced before the call returns. Any write or sync failure
 // poisons the log, so this call and every later one fail until restart. A
-// payload that fails the size check is rejected before the log is touched
-// and does not poison it.
+// payload that fails the size check is rejected with an OversizeError before
+// the log is touched and does not poison it.
 func (l *frameLog) appendFrame(payload []byte) (err error) {
 	if len(payload) > maxPayload {
-		return fmt.Errorf("%s exceeds %d byte frame limit", l.unit, maxPayload)
+		return &OversizeError{Unit: l.unit, Size: len(payload), Limit: maxPayload}
 	}
 
 	frame := make([]byte, headerSize+len(payload))

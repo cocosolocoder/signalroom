@@ -6,11 +6,14 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 
 	"github.com/cocosolocoder/signalroom/internal/events"
+	"github.com/cocosolocoder/signalroom/internal/logfile"
 )
 
 type fakeStorage struct {
@@ -466,6 +469,128 @@ func TestUnknownRouteAndMethod(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusMethodNotAllowed {
 		t.Fatalf("want 405, got %d", resp.StatusCode)
+	}
+}
+
+// newRealStorageServer builds a handler backed by a real on-disk log, so
+// capacity checks see the actual encoded frame sizes. It returns the server
+// and the data directory.
+func newRealStorageServer(t *testing.T) (*httptest.Server, string) {
+	t.Helper()
+	dir := t.TempDir()
+	log, _, err := logfile.Open(dir)
+	if err != nil {
+		t.Fatalf("open log: %v", err)
+	}
+	t.Cleanup(func() { log.Close() })
+	server := httptest.NewServer(NewHandler(events.NewTimeline(), log, log))
+	t.Cleanup(server.Close)
+	return server, dir
+}
+
+func fileSize(t *testing.T, path string) int64 {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	return info.Size()
+}
+
+func eventJSON(id, message string) string {
+	return `{"id":"` + id + `","service":"s","severity":"info","message":"` + message + `","at":"2026-10-01T09:00:00Z"}`
+}
+
+func TestOversizeBatchIs400NotStorageFailure(t *testing.T) {
+	server, dir := newRealStorageServer(t)
+	logPath := filepath.Join(dir, "events.log")
+
+	// A 12 MiB message of '<' fits the 16 MiB request body limit, but each
+	// character is saved as the 6-byte escape \u003c, pushing the encoded
+	// batch of new events past the 64 MiB save capacity.
+	big := `{"events":[` + eventJSON("big", strings.Repeat("<", 12<<20)) + `]}`
+	status, out := post(t, server, big)
+	if status != http.StatusBadRequest {
+		t.Fatalf("oversize batch must be 400, got %d %v", status, out)
+	}
+	msg, _ := out["error"].(string)
+	if msg == "" {
+		t.Fatal("error must be non-empty")
+	}
+	if !strings.Contains(msg, "capacity") || strings.Contains(msg, "restart") {
+		t.Fatalf("error must explain the capacity rejection without a restart hint, got %q", msg)
+	}
+
+	// The whole batch was rejected without touching storage: no record was
+	// written, nothing is visible, and the log is not poisoned.
+	if got := fileSize(t, logPath); got != 0 {
+		t.Fatalf("rejected batch must not append a record, log is %d bytes", got)
+	}
+	if status, rows := get(t, server, ""); status != http.StatusOK || len(rows.([]any)) != 0 {
+		t.Fatalf("rejected events must not be queryable: %d %v", status, rows)
+	}
+
+	// A later in-capacity batch succeeds without a restart, and the rejected
+	// id is still free to use.
+	status, out = post(t, server, `{"events":[`+eventJSON("big", "small")+`]}`)
+	if status != http.StatusOK || out["created"].(float64) != 1 || out["replayed"].(float64) != 0 {
+		t.Fatalf("in-capacity retry of the rejected id must succeed: %d %v", status, out)
+	}
+}
+
+func TestBatchCapacityCountsOnlyNewEvents(t *testing.T) {
+	server, dir := newRealStorageServer(t)
+	logPath := filepath.Join(dir, "events.log")
+
+	// Seed an event whose 6 MiB '<' message encodes to ~36 MiB.
+	seed := `{"events":[` + eventJSON("a", strings.Repeat("<", 6<<20)) + `]}`
+	if status, out := post(t, server, seed); status != http.StatusOK || out["created"].(float64) != 1 {
+		t.Fatalf("seed: %d %v", status, out)
+	}
+	seedSize := fileSize(t, logPath)
+
+	// A batch of identical retries only is accepted as a replay and appends
+	// no new record.
+	if status, out := post(t, server, seed); status != http.StatusOK || out["created"].(float64) != 0 || out["replayed"].(float64) != 1 {
+		t.Fatalf("pure replay: %d %v", status, out)
+	}
+	if got := fileSize(t, logPath); got != seedSize {
+		t.Fatalf("pure replay must not append a record: log grew from %d to %d", seedSize, got)
+	}
+
+	// The stored event (~36 MiB encoded) plus a new ~36 MiB event would
+	// exceed 64 MiB if retries counted toward the capacity. Only new events
+	// count, so the mixed batch is accepted.
+	mixed := `{"events":[` + eventJSON("a", strings.Repeat("<", 6<<20)) + `,` + eventJSON("b", strings.Repeat("<", 6<<20)) + `]}`
+	if status, out := post(t, server, mixed); status != http.StatusOK || out["created"].(float64) != 1 || out["replayed"].(float64) != 1 {
+		t.Fatalf("mixed retry+new batch within new-event capacity must succeed: %d %v", status, out)
+	}
+}
+
+func TestCapacityCheckRunsAfterValidationAndConflict(t *testing.T) {
+	server, _ := newRealStorageServer(t)
+	big := strings.Repeat("<", 12<<20)
+
+	seed := `{"events":[` + eventJSON("a", "m") + `]}`
+	if status, _ := post(t, server, seed); status != http.StatusOK {
+		t.Fatalf("seed: %d", status)
+	}
+
+	// An invalid event in an oversize batch still reports the validation
+	// problem, not the capacity one.
+	invalid := `{"events":[{"id":"b","service":"s","severity":"info","message":"","at":"2026-10-01T09:00:00Z"},` + eventJSON("c", big) + `]}`
+	status, out := post(t, server, invalid)
+	if status != http.StatusBadRequest {
+		t.Fatalf("invalid oversize batch must be 400, got %d %v", status, out)
+	}
+	if msg := out["error"].(string); !strings.Contains(msg, "required") {
+		t.Fatalf("validation must win over capacity, got %q", msg)
+	}
+
+	// A conflicting id in an oversize batch still reports the conflict.
+	conflict := `{"events":[` + eventJSON("a", "different") + `,` + eventJSON("c", big) + `]}`
+	if status, _ := post(t, server, conflict); status != http.StatusConflict {
+		t.Fatalf("conflicting oversize batch must be 409, got %d", status)
 	}
 }
 
