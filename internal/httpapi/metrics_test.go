@@ -247,6 +247,189 @@ func aggregateGet(t *testing.T, server *httptest.Server, query string) (int, []m
 	return resp.StatusCode, out
 }
 
+func TestPostMetricsDuplicateFieldsRejected(t *testing.T) {
+	server := newMetricsServer(t, nil, nil)
+
+	// uEscape renders a JSON \uXXXX escape without spelling it out in the
+	// source literal, so it stays a literal backslash-u sequence in the body.
+	uEscape := func(hexdigits, tail string) string {
+		return string('\\') + "u" + hexdigits + tail
+	}
+	valid := `{"id":"s9","service":"gw","name":"requests","at":"2026-10-01T10:00:00Z","value":1}`
+
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"outer field twice", `{"samples":[` + valid + `],"samples":[` + valid + `]}`},
+		{"outer field unicode escaped", `{"samples":[` + valid + `],"` + uEscape("0073", "amples") + `":[` + valid + `]}`},
+		{"sample field twice, same value", `{"samples":[{"id":"s9","id":"s9","service":"gw","name":"requests","at":"2026-10-01T10:00:00Z","value":1}]}`},
+		{"sample field null then legal", `{"samples":[{"id":null,"id":"s9","service":"gw","name":"requests","at":"2026-10-01T10:00:00Z","value":1}]}`},
+		{"sample field unicode escaped", `{"samples":[{"id":"s9","` + uEscape("0069", "d") + `":"s10","service":"gw","name":"requests","at":"2026-10-01T10:00:00Z","value":1}]}`},
+		{"labels name twice, same value", `{"samples":[{"id":"s9","service":"gw","name":"requests","at":"2026-10-01T10:00:00Z","value":1,"labels":{"env":"prod","env":"prod"}}]}`},
+		{"labels name unicode escaped", `{"samples":[{"id":"s9","service":"gw","name":"requests","at":"2026-10-01T10:00:00Z","value":1,"labels":{"env":"prod","` + uEscape("0065", "nv") + `":"dev"}}]}`},
+	}
+	for _, tc := range cases {
+		status, out := metricsDo(t, server, http.MethodPost, "/metrics", tc.body)
+		if status != http.StatusBadRequest {
+			t.Fatalf("%s: want 400, got %d (%v)", tc.name, status, out)
+		}
+		if msg, _ := out["error"].(string); msg == "" {
+			t.Fatalf("%s: non-empty error required, got %v", tc.name, out)
+		}
+		// A rejected request must not look like an ingestion result.
+		if _, present := out["created"]; present {
+			t.Fatalf("%s: created count must be absent, got %v", tc.name, out)
+		}
+		if _, present := out["replayed"]; present {
+			t.Fatalf("%s: replayed count must be absent, got %v", tc.name, out)
+		}
+	}
+
+	// The same names in different objects are not duplicates: distinct
+	// samples repeat field names and separate labels objects both carry env.
+	body := `{"samples":[
+		{"id":"a","service":"gw","name":"requests","at":"2026-10-01T10:00:00Z","value":1,"labels":{"env":"prod"}},
+		{"id":"b","service":"gw","name":"requests","at":"2026-10-01T10:00:01Z","value":2,"labels":{"env":"staging"}}
+	]}`
+	if out := postSamples(t, server, body); int(number(out["created"])) != 2 {
+		t.Fatalf("repeated names in separate objects must ingest: %v", out)
+	}
+}
+
+func TestPostMetricsDuplicateFieldRollsBackWholeBatch(t *testing.T) {
+	mstore := &fakeMetricStorage{}
+	server := newMetricsServer(t, metrics.NewStore(), mstore)
+
+	// One stored point in the window we will aggregate.
+	postSamples(t, server, `{"samples":[
+		{"id":"s0","service":"gw","name":"requests","at":"2026-10-01T10:00:00Z","value":10}
+	]}`)
+
+	window := "?name=requests&service=gw&since=2026-10-01T10:00:00Z&until=2026-10-01T10:01:00Z&step=60"
+	firstSeg := func(t *testing.T) map[string]any {
+		t.Helper()
+		status, out := aggregateGet(t, server, window)
+		if status != http.StatusOK || len(out) != 1 {
+			t.Fatalf("aggregate %d: %v", status, out)
+		}
+		segs := out[0]["segments"].([]any)
+		if len(segs) != 1 {
+			t.Fatalf("one segment: %v", segs)
+		}
+		return segs[0].(map[string]any)
+	}
+	before := firstSeg(t)
+	if int(number(before["count"])) != 1 || before["delta"].(float64) != 0 {
+		t.Fatalf("baseline: %v", before)
+	}
+
+	// A valid new sample followed by a sample with a duplicated field: the
+	// whole request is input-shaped rejection, and the leading sample must
+	// neither reach durable storage nor take its id or timestamp.
+	status, out := metricsDo(t, server, http.MethodPost, "/metrics", `{"samples":[
+		{"id":"s1","service":"gw","name":"requests","at":"2026-10-01T10:00:30Z","value":12},
+		{"id":"x1","id":"x2","service":"gw","name":"requests","at":"2026-10-01T10:00:40Z","value":1}
+	]}`)
+	if status != http.StatusBadRequest || out["error"] == "" {
+		t.Fatalf("trailing duplicate field must be 400, got %d %v", status, out)
+	}
+	if len(mstore.batches) != 1 {
+		t.Fatalf("rejected batch must never reach durable storage, appended %d batches", len(mstore.batches))
+	}
+	if seg := firstSeg(t); seg["count"] != before["count"] || seg["delta"] != before["delta"] {
+		t.Fatalf("stored series changed after rejection: before %v, after %v", before, seg)
+	}
+
+	// The same batch carrying content that would 409 against the stored
+	// sample still answers 400: format rejection precedes conflict handling.
+	status, out = metricsDo(t, server, http.MethodPost, "/metrics", `{"samples":[
+		{"id":"s0","service":"gw","name":"requests","at":"2026-10-01T10:00:00Z","value":99},
+		{"id":"x1","id":"x2","service":"gw","name":"requests","at":"2026-10-01T10:00:40Z","value":1}
+	]}`)
+	if status != http.StatusBadRequest || out["error"] == "" {
+		t.Fatalf("duplicate field plus stored conflict must stay 400, got %d %v", status, out)
+	}
+	if seg := firstSeg(t); seg["count"] != before["count"] || seg["delta"] != before["delta"] {
+		t.Fatalf("stored series changed after mixed rejection: before %v, after %v", before, seg)
+	}
+
+	// With the duplicate removed, the previously rejected id and timestamp
+	// are free and the samples ingest normally.
+	out = postSamples(t, server, `{"samples":[
+		{"id":"s1","service":"gw","name":"requests","at":"2026-10-01T10:00:30Z","value":12},
+		{"id":"s2","service":"gw","name":"requests","at":"2026-10-01T10:01:00Z","value":15}
+	]}`)
+	if int(number(out["created"])) != 2 || int(number(out["replayed"])) != 0 {
+		t.Fatalf("recovery ingestion: %v", out)
+	}
+
+	// Half-open window: s1 joins s0 in [10:00,10:01) with delta +2; the point
+	// at exactly 10:01 stays out of that window and lands in the next one.
+	seg := firstSeg(t)
+	if int(number(seg["count"])) != 2 || seg["delta"].(float64) != 2 {
+		t.Fatalf("window after recovery: %v", seg)
+	}
+	nextWindow := "?name=requests&service=gw&since=2026-10-01T10:01:00Z&until=2026-10-01T10:02:00Z&step=60"
+	nextStatus, nextAgg := aggregateGet(t, server, nextWindow)
+	if nextStatus != http.StatusOK || len(nextAgg) != 1 {
+		t.Fatalf("next window: %d %v", nextStatus, nextAgg)
+	}
+	nextSeg := nextAgg[0]["segments"].([]any)[0].(map[string]any)
+	if int(number(nextSeg["count"])) != 1 || nextSeg["delta"].(float64) != 3 {
+		t.Fatalf("point at window end must move to next segment (+3): %v", nextSeg)
+	}
+}
+
+func TestPostMetricsEmptyLabelShapesAccepted(t *testing.T) {
+	server := newMetricsServer(t, nil, nil)
+	bodies := []string{
+		`{"samples":[{"id":"n1","service":"gw","name":"requests","at":"2026-10-01T10:00:00Z","value":1}]}`,
+		`{"samples":[{"id":"n2","service":"gw","name":"requests","at":"2026-10-01T10:00:01Z","value":2,"labels":null}]}`,
+		`{"samples":[{"id":"n3","service":"gw","name":"requests","at":"2026-10-01T10:00:02Z","value":3,"labels":{}}]}`,
+	}
+	for i, body := range bodies {
+		out := postSamples(t, server, body)
+		if int(number(out["created"])) != 1 {
+			t.Fatalf("case %d: %v", i, out)
+		}
+	}
+	status, agg := aggregateGet(t, server,
+		"?name=requests&service=gw&since=2026-10-01T10:00:00Z&until=2026-10-01T10:01:00Z&step=60")
+	if status != http.StatusOK || len(agg) != 1 {
+		t.Fatalf("aggregate: %d %v", status, agg)
+	}
+	if _, hasLabels := agg[0]["labels"]; hasLabels {
+		t.Fatalf("all three shapes mean no labels: %v", agg[0])
+	}
+	if int(number(agg[0]["segments"].([]any)[0].(map[string]any)["count"])) != 3 {
+		t.Fatalf("all three samples share the label-less series: %v", agg[0])
+	}
+}
+
+func TestPostMetricsDuplicateIDAcrossSamplesIsConflict(t *testing.T) {
+	// Two well-formed samples sharing one id is a content conflict (409), not
+	// a duplicate JSON field (400): the repeated name lives in different
+	// objects, while one object naming id twice is still a format error.
+	server := newMetricsServer(t, nil, nil)
+	postSamples(t, server, `{"samples":[{"id":"s1","service":"gw","name":"requests","at":"2026-10-01T10:00:00Z","value":1}]}`)
+
+	dupIDAcrossSamples := `{"samples":[
+		{"id":"d","service":"gw","name":"requests","at":"2026-10-01T10:00:01Z","value":1},
+		{"id":"d","service":"gw","name":"requests","at":"2026-10-01T10:00:02Z","value":2}
+	]}`
+	if status, _ := metricsDo(t, server, http.MethodPost, "/metrics", dupIDAcrossSamples); status != http.StatusConflict {
+		t.Fatalf("repeated id across samples must be 409, got %d", status)
+	}
+	dupFieldInOneSample := `{"samples":[
+		{"id":"f","service":"gw","name":"requests","at":"2026-10-01T10:00:01Z","value":1},
+		{"id":"g","id":"h","service":"gw","name":"requests","at":"2026-10-01T10:00:02Z","value":2}
+	]}`
+	if status, _ := metricsDo(t, server, http.MethodPost, "/metrics", dupFieldInOneSample); status != http.StatusBadRequest {
+		t.Fatalf("repeated field within one sample must be 400, got %d", status)
+	}
+}
+
 func TestGetMetricsAggregateShapeAndDeltas(t *testing.T) {
 	server := newMetricsServer(t, nil, nil)
 	postSamples(t, server, `{"samples":[
