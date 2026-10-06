@@ -147,8 +147,7 @@ func (t *Timeline) PreviewAlerts(query AlertPreviewQuery) (AlertPreviewResult, e
 		return AlertPreviewResult{}, err
 	}
 
-	service := strings.TrimSpace(query.Service)
-	severity := strings.ToLower(strings.TrimSpace(query.Severity))
+	filter := query.Filter()
 
 	// Sparse counts collected under one read lock: encoded group key ->
 	// window index -> count. keys remembers the decoded identity of each
@@ -160,13 +159,7 @@ func (t *Timeline) PreviewAlerts(query AlertPreviewQuery) (AlertPreviewResult, e
 
 	t.mu.RLock()
 	for _, event := range t.events {
-		if service != "" && event.Service != service {
-			continue
-		}
-		if severity != "" && event.Severity != severity {
-			continue
-		}
-		if !labelsMatch(event.Labels, query.Labels) {
+		if !filter.Matches(event) {
 			continue
 		}
 		index, ok := bucketIndex(event.At, query.Since, query.Until, query.Window)

@@ -53,9 +53,10 @@ type snapshotQuery struct {
 }
 
 func snapshotQueryFromQuery(q events.Query) snapshotQuery {
+	filter := q.Filter()
 	return snapshotQuery{
-		Service:  strings.TrimSpace(q.Service),
-		Severity: strings.ToLower(strings.TrimSpace(q.Severity)),
+		Service:  filter.Service,
+		Severity: filter.Severity,
 		Since:    q.Since,
 		Until:    q.Until,
 		Labels:   q.Labels,
@@ -67,10 +68,11 @@ func snapshotQueryFromQuery(q events.Query) snapshotQuery {
 // surrounding whitespace are normalized away. An absent bound (nil) differs
 // from an explicit boundary, even one at the zero instant.
 func (sq snapshotQuery) matches(q events.Query) bool {
-	if sq.Service != strings.TrimSpace(q.Service) {
+	filter := q.Filter()
+	if sq.Service != filter.Service {
 		return false
 	}
-	if sq.Severity != strings.ToLower(strings.TrimSpace(q.Severity)) {
+	if sq.Severity != filter.Severity {
 		return false
 	}
 	if !timePtrEqual(sq.Since, q.Since) || !timePtrEqual(sq.Until, q.Until) {

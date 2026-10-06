@@ -112,26 +112,19 @@ func (s *Store) Add(event Event) error {
 }
 
 func (s *Store) Query(query Query) []Event {
-	service := strings.TrimSpace(query.Service)
-	severity := strings.ToLower(strings.TrimSpace(query.Severity))
+	filter := query.Filter()
 
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	result := make([]Event, 0, len(s.events))
 	for _, event := range s.events {
-		if service != "" && event.Service != service {
-			continue
-		}
-		if severity != "" && event.Severity != severity {
+		if !filter.Matches(event) {
 			continue
 		}
 		if query.Since != nil && event.At.Before(*query.Since) {
 			continue
 		}
 		if query.Until != nil && event.At.After(*query.Until) {
-			continue
-		}
-		if !labelsMatch(event.Labels, query.Labels) {
 			continue
 		}
 		result = append(result, event)

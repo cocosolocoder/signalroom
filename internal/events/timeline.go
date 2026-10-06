@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"maps"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 )
@@ -182,23 +181,16 @@ func (q Query) withinBounds(at time.Time) bool {
 // Query returns the events matching the optional filters, ordered by time and
 // then by id. Time equality uses absolute instants.
 func (t *Timeline) Query(query Query) []Event {
-	service := strings.TrimSpace(query.Service)
-	severity := strings.ToLower(strings.TrimSpace(query.Severity))
+	filter := query.Filter()
 
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	result := make([]Event, 0, len(t.events))
 	for _, event := range t.events {
-		if service != "" && event.Service != service {
-			continue
-		}
-		if severity != "" && event.Severity != severity {
+		if !filter.Matches(event) {
 			continue
 		}
 		if !query.withinBounds(event.At) {
-			continue
-		}
-		if !labelsMatch(event.Labels, query.Labels) {
 			continue
 		}
 		result = append(result, event)
@@ -212,23 +204,16 @@ func (t *Timeline) Query(query Query) []Event {
 // added after the call never appear in the returned set, which makes it
 // suitable for stable pagination across later writes.
 func (t *Timeline) SnapshotIDs(query Query) []string {
-	service := strings.TrimSpace(query.Service)
-	severity := strings.ToLower(strings.TrimSpace(query.Severity))
+	filter := query.Filter()
 
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	ids := make([]string, 0, len(t.events))
 	for _, event := range t.events {
-		if service != "" && event.Service != service {
-			continue
-		}
-		if severity != "" && event.Severity != severity {
+		if !filter.Matches(event) {
 			continue
 		}
 		if !query.withinBounds(event.At) {
-			continue
-		}
-		if !labelsMatch(event.Labels, query.Labels) {
 			continue
 		}
 		ids = append(ids, event.ID)
