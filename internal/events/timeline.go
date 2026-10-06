@@ -250,6 +250,16 @@ func (t *Timeline) EventsByID(ids []string) []Event {
 	return out
 }
 
+// SameEvent reports whether two normalized events carry the same content for
+// the same id. It is the single comparison rule behind replay de-duplication,
+// live id-retry handling, and startup recovery of durable batches: equality
+// on the absolute instant and on the normalized label sets, so trimmed
+// strings, severity case, time-zone spelling, label order, and the three
+// "no labels" spellings never make identical events look different.
+func SameEvent(a, b Event) bool {
+	return sameEvent(a, b)
+}
+
 // sameEvent compares two normalized events on their absolute instant and
 // their labels. Normalized label sets are nil when empty, so the three "no
 // labels" spellings compare equal, and map comparison makes key order and

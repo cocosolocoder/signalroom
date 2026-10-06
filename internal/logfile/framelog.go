@@ -58,7 +58,14 @@ type frameLog struct {
 // truncates at most one incomplete trailing frame. A corrupt frame in the
 // middle, or a complete frame whose payload decode rejects, is fatal and
 // leaves the file untouched.
-func openFrameLog[T any](dir, name, noun, unit string, decode func(payload []byte) (T, error)) (*frameLog, []T, error) {
+//
+// validate, when non-nil, runs once over every complete decoded frame before
+// the torn tail is trimmed. A contradiction only visible across the whole
+// replay (for events, the same id carrying different normalized content in
+// two complete frames) must be rejected there, so a startup that fails never
+// mutates the file: the incomplete tail stays on disk for inspection. Its
+// error is returned unwrapped.
+func openFrameLog[T any](dir, name, noun, unit string, decode func(payload []byte) (T, error), validate func(items []T) error) (*frameLog, []T, error) {
 	path := filepath.Join(dir, name)
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
 	if err != nil {
@@ -69,6 +76,15 @@ func openFrameLog[T any](dir, name, noun, unit string, decode func(payload []byt
 	if err != nil {
 		file.Close()
 		return nil, nil, err
+	}
+	// Whole-replay validation precedes the only recovery-time mutation: the
+	// tail trim below. Anything that should stop startup must be detected
+	// before the first byte of the file changes.
+	if validate != nil {
+		if err := validate(items); err != nil {
+			file.Close()
+			return nil, nil, err
+		}
 	}
 	if info, statErr := file.Stat(); statErr == nil && validLen < info.Size() {
 		// Drop exactly one incomplete trailing frame; the only mutation

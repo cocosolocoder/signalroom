@@ -30,7 +30,7 @@ func OpenMetricsLog(dir string) (*MetricsLog, [][]metrics.Sample, error) {
 	if dir == "" {
 		return nil, nil, fmt.Errorf("data directory is required")
 	}
-	base, batches, err := openFrameLog(dir, metricsLogName, "metrics", "metric batch", decodeMetricBatch)
+	base, batches, err := openFrameLog(dir, metricsLogName, "metrics", "metric batch", decodeMetricBatch, nil)
 	if err != nil {
 		return nil, nil, err
 	}

@@ -30,7 +30,7 @@ func OpenIncidentLog(dir string) (*IncidentLog, []incidents.Record, error) {
 	if dir == "" {
 		return nil, nil, fmt.Errorf("data directory is required")
 	}
-	base, records, err := openFrameLog(dir, incidentLogName, "incident", "incident record", incidents.DecodeRecord)
+	base, records, err := openFrameLog(dir, incidentLogName, "incident", "incident record", incidents.DecodeRecord, nil)
 	if err != nil {
 		return nil, nil, err
 	}
