@@ -3,11 +3,12 @@ package metrics
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
 	"time"
 
 	"github.com/cocosolocoder/signalroom/internal/events"
+	"github.com/cocosolocoder/signalroom/internal/strictjson"
 )
 
 // sampleDTO is the on-disk representation of a normalized sample. Timestamps
@@ -64,80 +65,57 @@ func MarshalBatch(batch []Sample) ([]byte, error) {
 // labels, and trailing data are all rejected; callers remain responsible for
 // the empty-array check and content validation.
 func DecodeBatch(data []byte) ([]Sample, error) {
-	dec := json.NewDecoder(bytes.NewReader(data))
-	open, err := dec.Token()
+	raw, err := strictjson.DecodeArray(data, "decode samples array", decodeSample)
 	if err != nil {
-		return nil, fmt.Errorf("decode samples array: %w", err)
+		return nil, samplesStructureError(err)
 	}
-	if delim, ok := open.(json.Delim); !ok || delim != '[' {
-		return nil, fmt.Errorf("decode samples array: must be an array")
-	}
-
-	var batch []Sample
-	for dec.More() {
-		raw, err := decodeSample(dec)
-		if err != nil {
-			return nil, err
+	batch := make([]Sample, len(raw))
+	for i, s := range raw {
+		batch[i] = Sample{
+			ID:      s.id,
+			Service: s.service,
+			Name:    s.name,
+			At:      s.at,
+			Value:   s.value,
+			Labels:  s.labels,
 		}
-		batch = append(batch, Sample{
-			ID:      raw.id,
-			Service: raw.service,
-			Name:    raw.name,
-			At:      raw.at,
-			Value:   raw.value,
-			Labels:  raw.labels,
-		})
-	}
-	if _, err := dec.Token(); err != nil { // closing ']'
-		return nil, fmt.Errorf("decode samples array: %w", err)
-	}
-	var extra json.RawMessage
-	if err := dec.Decode(&extra); err != io.EOF {
-		if err == nil {
-			return nil, fmt.Errorf("decode samples array: unexpected trailing data")
-		}
-		return nil, fmt.Errorf("decode samples array: %w", err)
 	}
 	return batch, nil
+}
+
+// samplesStructureError restores the samples wording for the shapes the
+// shared scanner describes generically; syntax, unknown-field, duplicate,
+// and trailing-data messages already match.
+func samplesStructureError(err error) error {
+	var se *strictjson.Error
+	if !errors.As(err, &se) {
+		return err
+	}
+	switch se.Kind {
+	case strictjson.KindNotArray:
+		return errors.New("decode samples array: must be an array")
+	case strictjson.KindNotObject:
+		return errors.New("decode sample: each sample must be an object")
+	case strictjson.KindNameNotString:
+		return errors.New("decode sample: field names must be strings")
+	default:
+		return err
+	}
 }
 
 // decodeSample reads exactly one sample object, rejecting unknown and
 // duplicate members rather than letting a struct decode silently keep the
 // last value.
 func decodeSample(dec *json.Decoder) (rawSample, error) {
-	open, err := dec.Token()
-	if err != nil {
-		return rawSample{}, fmt.Errorf("decode sample: %w", err)
-	}
-	if delim, ok := open.(json.Delim); !ok || delim != '{' {
-		return rawSample{}, fmt.Errorf("decode sample: each sample must be an object")
-	}
-
 	var raw rawSample
 	var labelsRaw json.RawMessage
-	seen := make(map[string]struct{})
-	for dec.More() {
-		keyToken, err := dec.Token()
-		if err != nil {
-			return rawSample{}, fmt.Errorf("decode sample: %w", err)
-		}
-		key, ok := keyToken.(string)
-		if !ok {
-			return rawSample{}, fmt.Errorf("decode sample: field names must be strings")
-		}
-		if _, known := allowedSampleFields[key]; !known {
-			return rawSample{}, fmt.Errorf("decode sample: unknown field %q", key)
-		}
-		if _, dup := seen[key]; dup {
-			return rawSample{}, fmt.Errorf("decode sample: duplicate field %q", key)
-		}
-		seen[key] = struct{}{}
-
+	valuePresent := false
+	err := strictjson.EachObjectField(dec, "decode sample", allowedSampleFields, func(key string, token json.RawMessage) error {
 		switch key {
 		case "id", "service", "name":
 			var value string
-			if err := dec.Decode(&value); err != nil {
-				return rawSample{}, fmt.Errorf("decode sample: %s must be a string", key)
+			if err := json.Unmarshal(token, &value); err != nil {
+				return fmt.Errorf("decode sample: %s must be a string", key)
 			}
 			switch key {
 			case "id":
@@ -148,46 +126,37 @@ func decodeSample(dec *json.Decoder) (rawSample, error) {
 				raw.name = value
 			}
 		case "at":
-			var at time.Time
-			if err := dec.Decode(&at); err != nil {
-				return rawSample{}, fmt.Errorf("decode sample: at must be an RFC3339Nano timestamp")
+			if err := json.Unmarshal(token, &raw.at); err != nil {
+				return errors.New("decode sample: at must be an RFC3339Nano timestamp")
 			}
-			raw.at = at
 		case "value":
-			// Decode the raw token first: json.Number has an underlying string
-			// type, so a quoted "1" would otherwise decode into it. Require
-			// the token to literally be a JSON number before parsing.
-			var token json.RawMessage
-			if err := dec.Decode(&token); err != nil {
-				return rawSample{}, fmt.Errorf("decode sample: value must be a JSON number")
-			}
+			// Require the token to literally be a JSON number before parsing:
+			// json.Number has an underlying string type, so a quoted "1" would
+			// otherwise decode into it.
 			number := bytes.TrimSpace(token)
-			if !isJSONNumber(number) {
-				return rawSample{}, fmt.Errorf("decode sample: value must be a non-negative, finite JSON number")
-			}
-			value, err := json.Number(number).Float64()
-			if err != nil || !finiteNonNegative(value) {
-				return rawSample{}, fmt.Errorf("decode sample: value must be a non-negative, finite JSON number")
+			value, ferr := json.Number(number).Float64()
+			if !isJSONNumber(number) || ferr != nil || !finiteNonNegative(value) {
+				return errors.New("decode sample: value must be a non-negative, finite JSON number")
 			}
 			raw.value = value
+			valuePresent = true
 		case "labels":
-			if err := dec.Decode(&labelsRaw); err != nil {
-				return rawSample{}, fmt.Errorf("decode sample: labels must be an object")
-			}
+			labelsRaw = token
 		}
-	}
-	if _, err := dec.Token(); err != nil { // closing '}'
-		return rawSample{}, fmt.Errorf("decode sample: %w", err)
+		return nil
+	})
+	if err != nil {
+		return rawSample{}, samplesStructureError(err)
 	}
 
-	labels, err := events.DecodeLabelsObject(labelsRaw)
-	if err != nil {
-		return rawSample{}, err
+	labels, lerr := events.DecodeLabelsObject(labelsRaw)
+	if lerr != nil {
+		return rawSample{}, lerr
 	}
 	// value has no useful zero value, so an absent member is an error rather
 	// than a silent 0; id/service/name/at are caught by later normalization.
-	if _, ok := seen["value"]; !ok {
-		return rawSample{}, fmt.Errorf("decode sample: value is required")
+	if !valuePresent {
+		return rawSample{}, errors.New("decode sample: value is required")
 	}
 	raw.labels = labels
 	return raw, nil

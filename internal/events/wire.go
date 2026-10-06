@@ -3,9 +3,11 @@ package events
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
 	"time"
+
+	"github.com/cocosolocoder/signalroom/internal/strictjson"
 )
 
 // eventDTO is the wire and on-disk representation of an event. Timestamps use
@@ -34,46 +36,48 @@ func decodeLabels(raw json.RawMessage) (map[string]string, error) {
 // would. Name/value content rules are enforced later by NormalizeLabels or
 // filter normalization.
 func DecodeLabelsObject(raw json.RawMessage) (map[string]string, error) {
+	const what = "decode labels"
 	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
 		return nil, nil
 	}
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	open, err := dec.Token()
+	fields, err := strictjson.DecodeObject(raw, what, nil)
 	if err != nil {
-		return nil, fmt.Errorf("decode labels: %w", err)
+		return nil, labelsStructureError(err)
 	}
-	if delim, ok := open.(json.Delim); !ok || delim != '{' {
-		return nil, fmt.Errorf("decode labels: must be an object of string values")
-	}
-	labels := make(map[string]string)
-	for dec.More() {
-		keyToken, err := dec.Token()
-		if err != nil {
-			return nil, fmt.Errorf("decode labels: %w", err)
+	labels := make(map[string]string, len(fields))
+	for key, rawValue := range fields {
+		if bytes.Equal(rawValue, []byte("null")) {
+			return nil, fmt.Errorf("%s: value for %q must be a string", what, key)
 		}
-		key, ok := keyToken.(string)
-		if !ok {
-			return nil, fmt.Errorf("decode labels: names must be strings")
+		var value string
+		if err := json.Unmarshal(rawValue, &value); err != nil {
+			return nil, fmt.Errorf("%s: value for %q must be a string", what, key)
 		}
-		if _, dup := labels[key]; dup {
-			return nil, fmt.Errorf("decode labels: duplicate label name %q", key)
-		}
-		var value *string
-		if err := dec.Decode(&value); err != nil {
-			return nil, fmt.Errorf("decode labels: value for %q must be a string", key)
-		}
-		if value == nil {
-			return nil, fmt.Errorf("decode labels: value for %q must be a string", key)
-		}
-		labels[key] = *value
-	}
-	if _, err := dec.Token(); err != nil { // closing '}'
-		return nil, fmt.Errorf("decode labels: %w", err)
+		labels[key] = value
 	}
 	if len(labels) == 0 {
 		return nil, nil
 	}
 	return labels, nil
+}
+
+// labelsStructureError restores the labels wording on top of the shared
+// structural rejection; the other kinds already render identically.
+func labelsStructureError(err error) error {
+	var se *strictjson.Error
+	if !errors.As(err, &se) {
+		return err
+	}
+	switch se.Kind {
+	case strictjson.KindNotObject:
+		return errors.New("decode labels: must be an object of string values")
+	case strictjson.KindNameNotString:
+		return errors.New("decode labels: names must be strings")
+	case strictjson.KindDuplicateField:
+		return fmt.Errorf("decode labels: duplicate label name %q", se.Field)
+	default:
+		return err
+	}
 }
 
 // allowedEventFields is the exact set of members each event object may
@@ -110,35 +114,31 @@ func MarshalBatch(batch []Event) ([]byte, error) {
 // Names are compared after JSON decoding, so a literal name and its \uXXXX
 // escape of the same text count as a repeat.
 func DecodeBatch(data []byte) ([]Event, error) {
-	dec := json.NewDecoder(bytes.NewReader(data))
-	open, err := dec.Token()
+	batch, err := strictjson.DecodeArray(data, "decode events array", decodeEventObject)
 	if err != nil {
-		return nil, fmt.Errorf("decode events array: %w", err)
-	}
-	if delim, ok := open.(json.Delim); !ok || delim != '[' {
-		return nil, fmt.Errorf("decode events array: must be an array of event objects")
-	}
-
-	var batch []Event
-	for dec.More() {
-		event, err := decodeEventObject(dec)
-		if err != nil {
-			return nil, err
-		}
-		batch = append(batch, event)
-	}
-
-	if _, err := dec.Token(); err != nil { // closing ']'
-		return nil, fmt.Errorf("decode events array: %w", err)
-	}
-	var extra json.RawMessage
-	if err := dec.Decode(&extra); err != io.EOF {
-		if err == nil {
-			return nil, fmt.Errorf("decode events array: unexpected trailing data")
-		}
-		return nil, fmt.Errorf("decode events array: %w", err)
+		return nil, eventsStructureError(err)
 	}
 	return batch, nil
+}
+
+// eventsStructureError restores the event-batch wording for the shapes the
+// shared scanner describes generically; syntax, unknown-field, duplicate,
+// and trailing-data messages already match.
+func eventsStructureError(err error) error {
+	var se *strictjson.Error
+	if !errors.As(err, &se) {
+		return err
+	}
+	switch se.Kind {
+	case strictjson.KindNotArray:
+		return errors.New("decode events array: must be an array of event objects")
+	case strictjson.KindNotObject:
+		return errors.New("decode events array: each entry must be an object")
+	case strictjson.KindNameNotString:
+		return errors.New("decode events array: event field names must be strings")
+	default:
+		return err
+	}
 }
 
 // decodeEventObject reads one event object from dec, rejecting unknown
@@ -146,69 +146,41 @@ func DecodeBatch(data []byte) ([]Event, error) {
 // the same typed-decoding behavior as a struct decode: strings, RFC3339
 // timestamps, and the strict labels shape.
 func decodeEventObject(dec *json.Decoder) (Event, error) {
+	const what = "decode events array"
 	var event Event
-	open, err := dec.Token()
-	if err != nil {
-		return Event{}, fmt.Errorf("decode events array: %w", err)
-	}
-	if delim, ok := open.(json.Delim); !ok || delim != '{' {
-		return Event{}, fmt.Errorf("decode events array: each entry must be an object")
-	}
-
-	seen := make(map[string]struct{})
-	for dec.More() {
-		keyToken, err := dec.Token()
-		if err != nil {
-			return Event{}, fmt.Errorf("decode events array: %w", err)
-		}
-		key, ok := keyToken.(string)
-		if !ok {
-			return Event{}, fmt.Errorf("decode events array: event field names must be strings")
-		}
-		if _, known := allowedEventFields[key]; !known {
-			return Event{}, fmt.Errorf("decode events array: unknown field %q", key)
-		}
-		if _, dup := seen[key]; dup {
-			return Event{}, fmt.Errorf("decode events array: duplicate field %q", key)
-		}
-		seen[key] = struct{}{}
-
+	err := strictjson.EachObjectField(dec, what, allowedEventFields, func(key string, raw json.RawMessage) error {
 		switch key {
 		case "id":
-			if err := dec.Decode(&event.ID); err != nil {
-				return Event{}, fmt.Errorf("decode events array: id has the wrong type")
+			if err := json.Unmarshal(raw, &event.ID); err != nil {
+				return fmt.Errorf("%s: id has the wrong type", what)
 			}
 		case "service":
-			if err := dec.Decode(&event.Service); err != nil {
-				return Event{}, fmt.Errorf("decode events array: service has the wrong type")
+			if err := json.Unmarshal(raw, &event.Service); err != nil {
+				return fmt.Errorf("%s: service has the wrong type", what)
 			}
 		case "severity":
-			if err := dec.Decode(&event.Severity); err != nil {
-				return Event{}, fmt.Errorf("decode events array: severity has the wrong type")
+			if err := json.Unmarshal(raw, &event.Severity); err != nil {
+				return fmt.Errorf("%s: severity has the wrong type", what)
 			}
 		case "message":
-			if err := dec.Decode(&event.Message); err != nil {
-				return Event{}, fmt.Errorf("decode events array: message has the wrong type")
+			if err := json.Unmarshal(raw, &event.Message); err != nil {
+				return fmt.Errorf("%s: message has the wrong type", what)
 			}
 		case "at":
-			if err := dec.Decode(&event.At); err != nil {
-				return Event{}, fmt.Errorf("decode events array: at must be an RFC3339Nano timestamp")
+			if err := json.Unmarshal(raw, &event.At); err != nil {
+				return fmt.Errorf("%s: at must be an RFC3339Nano timestamp", what)
 			}
 		case "labels":
-			var raw json.RawMessage
-			if err := dec.Decode(&raw); err != nil {
-				return Event{}, fmt.Errorf("decode events array: %w", err)
-			}
 			labels, lerr := decodeLabels(raw)
 			if lerr != nil {
-				return Event{}, lerr
+				return lerr
 			}
 			event.Labels = labels
 		}
-	}
-
-	if _, err := dec.Token(); err != nil { // closing '}'
-		return Event{}, fmt.Errorf("decode events array: %w", err)
+		return nil
+	})
+	if err != nil {
+		return Event{}, eventsStructureError(err)
 	}
 	return event, nil
 }

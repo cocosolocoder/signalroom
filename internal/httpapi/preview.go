@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/cocosolocoder/signalroom/internal/events"
+	"github.com/cocosolocoder/signalroom/internal/strictjson"
 )
 
 // maxGroupLabels bounds how many label names a preview request may group by.
@@ -322,49 +323,11 @@ func decodeRaw(w http.ResponseWriter, raw json.RawMessage, name string, target a
 
 // decodeStrictObject decodes the outer JSON value, requiring an object with
 // unique member names drawn from allowed. Syntax errors, non-objects,
-// trailing tokens, duplicate keys, and unknown fields are all rejected.
+// trailing tokens, duplicate keys, and unknown fields are all rejected. It
+// is the request-body form of the strict object scan the batch decoders
+// share in internal/strictjson.
 func decodeStrictObject(body []byte, allowed map[string]struct{}) (map[string]json.RawMessage, error) {
-	dec := json.NewDecoder(bytes.NewReader(body))
-	open, err := dec.Token()
-	if err != nil {
-		return nil, err
-	}
-	if delim, ok := open.(json.Delim); !ok || delim != '{' {
-		return nil, errors.New("body must be a JSON object")
-	}
-	fields := make(map[string]json.RawMessage)
-	for dec.More() {
-		keyToken, err := dec.Token()
-		if err != nil {
-			return nil, err
-		}
-		key, ok := keyToken.(string)
-		if !ok {
-			return nil, errors.New("object keys must be strings")
-		}
-		if _, known := allowed[key]; !known {
-			return nil, errors.New("unknown field " + key)
-		}
-		if _, dup := fields[key]; dup {
-			return nil, errors.New("duplicate field " + key)
-		}
-		var value json.RawMessage
-		if err := dec.Decode(&value); err != nil {
-			return nil, err
-		}
-		fields[key] = value
-	}
-	if _, err := dec.Token(); err != nil {
-		return nil, err
-	}
-	var extra json.RawMessage
-	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
-		if err == nil {
-			return nil, errors.New("unexpected trailing data")
-		}
-		return nil, err
-	}
-	return fields, nil
+	return strictjson.DecodeObject(body, "request body", allowed)
 }
 
 func writePreviewError(w http.ResponseWriter, err error) {
