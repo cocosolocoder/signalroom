@@ -294,14 +294,39 @@ taking precedence over conflict checks:
   Numeric values compare numerically (`1` and `1.0` are the same) and time
   equality uses absolute instants (equivalent timezones are the same); label
   order and surrounding whitespace are irrelevant.
-- `400` — invalid JSON, unknown/duplicate fields, an empty array, or a sample
-  failing validation. Nothing from the batch is written.
+- `400` — invalid JSON, unknown/duplicate fields, an empty array, a sample
+  failing validation, or a batch whose **new** samples save to more than
+  **64 MiB** (`1024*1024` bytes per MiB) in the storage format. Nothing from
+  the batch is written.
 - `409` — an id already stored with different normalized content, an id
   repeated within the batch, or two different ids claiming the same series at
   the same instant. A series is identified by the service, metric name, and
   the complete label set. Nothing is changed.
 - `503` — metric storage has failed; this and later metric requests fail until
   restart. Event and incident endpoints are unaffected.
+
+The request body is capped at 16 MiB, but storage measures the bytes
+actually saved: the save format JSON-escapes content, so characters such as
+`<`, `>`, and `&` take more saved bytes than request bytes (a `<` is one
+request byte but six saved bytes). A legal, under-16-MiB body whose escaped
+new samples would exceed 64 MiB is rejected with `400` and a non-empty
+`error` that names the per-batch save capacity and asks to split or shrink
+the submission. The 64 MiB limit covers the JSON bytes of the normalized new
+sample array alone — not the request body's outer object and not the
+surrounding record header; a batch encoding to exactly 64 MiB is accepted.
+
+This is a content limit, not a storage fault, so it behaves like any other
+`400`: the whole batch is refused with nothing written to disk, no new sample
+id consumed, no change to existing aggregate results, and the metric store
+keeps serving queries and submissions without a restart; the rejected ids
+remain free for a smaller follow-up batch. Only brand-new samples count
+toward the limit — identical retries are not saved again, so a batch mixing
+retries with new samples is measured by the new samples alone, and an
+all-retry batch returns the usual `{"created":0,"replayed":...}` regardless
+of how large the stored content is. The capacity check runs after field,
+label, timestamp, and value validation (`400`) and id/point conflict checks
+(`409`). A genuine write or sync failure still returns `503` and keeps metric
+requests unavailable until restart; only that case calls for a restart.
 
 Concurrent submissions still commit as whole batches, and an identical retry
 is stored at most once.

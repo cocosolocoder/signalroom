@@ -101,6 +101,8 @@ func (h *Handler) postMetrics(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case metrics.IsValidationError(err):
 			writeError(w, http.StatusBadRequest, err.Error())
+		case metrics.IsOversizeBatchError(err):
+			writeError(w, http.StatusBadRequest, err.Error())
 		case metrics.IsConflictError(err):
 			writeError(w, http.StatusConflict, err.Error())
 		default:

@@ -5,6 +5,7 @@ package metrics
 
 import (
 	"errors"
+	"fmt"
 	"maps"
 	"math"
 	"sort"
@@ -15,6 +16,14 @@ import (
 
 	"github.com/cocosolocoder/signalroom/internal/events"
 )
+
+// MaxBatchPayloadBytes bounds what one metric save may hold in the on-disk
+// save format (MarshalBatch): 64 MiB in 1024*1024-byte units, matching the
+// durable frame capacity. It measures the encoded JSON content of the newly
+// saved samples only — not any replayed samples, the request body's outer
+// object, or the surrounding frame header. A batch encoding to exactly this
+// size is still accepted; only a larger encoding is rejected.
+const MaxBatchPayloadBytes = 64 << 20
 
 // ValidationError reports that a sample failed normalization (or, during
 // aggregation, that a query was invalid).
@@ -37,6 +46,28 @@ func (e *ConflictError) Error() string { return e.Reason }
 // IsConflictError reports whether err is a metrics conflict.
 func IsConflictError(err error) bool {
 	var target *ConflictError
+	return errors.As(err, &target)
+}
+
+// OversizeBatchError reports that the brand-new samples of a batch encode to
+// more than MaxBatchPayloadBytes in the save format. It is a property of the
+// request content, not of the storage: nothing is written, the store stays
+// usable without a restart, the rejected ids remain free, and the same
+// samples are accepted once split into smaller submissions. Replayed
+// samples are not part of the measured payload.
+type OversizeBatchError struct {
+	Size  int
+	Limit int
+}
+
+func (e *OversizeBatchError) Error() string {
+	return fmt.Sprintf("metric batch saves to %d bytes, exceeding the %d byte per-batch save capacity; split the submission into smaller batches or reduce its content", e.Size, e.Limit)
+}
+
+// IsOversizeBatchError reports whether err is a batch that exceeds the save
+// capacity, as opposed to a validation, conflict, or storage failure.
+func IsOversizeBatchError(err error) bool {
+	var target *OversizeBatchError
 	return errors.As(err, &target)
 }
 
@@ -136,6 +167,11 @@ type IngestResult struct {
 // the batch, or a (series, time) clash between different ids produce a
 // ConflictError. Nothing is stored when an error is returned.
 //
+// After those checks, the JSON bytes the brand-new samples would actually
+// save (MarshalBatch of only the new samples, with the save format's JSON
+// escaping applied) are measured against MaxBatchPayloadBytes; an oversize
+// batch produces an OversizeBatchError, still before anything is written.
+//
 // New samples are passed to beforeCommit for durable storage; only after it
 // succeeds does the batch become visible, so concurrent readers see either the
 // complete batch or none of it, and concurrent batches serialize so the whole
@@ -199,6 +235,19 @@ func (s *Store) Ingest(batch []Sample, beforeCommit BeforeCommit) (IngestResult,
 	}
 
 	if len(created) > 0 {
+		// Only brand-new samples are saved, so only they count toward the save
+		// capacity: a batch made entirely (or partly) of identical retries is
+		// measured by what would actually be written. The check runs after
+		// validation and conflict checks but before beforeCommit, so an
+		// oversize batch neither touches durable storage nor marks metric
+		// storage unavailable.
+		payload, err := MarshalBatch(created)
+		if err != nil {
+			return IngestResult{}, err
+		}
+		if len(payload) > MaxBatchPayloadBytes {
+			return IngestResult{}, &OversizeBatchError{Size: len(payload), Limit: MaxBatchPayloadBytes}
+		}
 		if beforeCommit != nil {
 			if err := beforeCommit(created); err != nil {
 				return IngestResult{}, err
