@@ -53,30 +53,33 @@ type snapshotQuery struct {
 }
 
 func snapshotQueryFromQuery(q events.Query) snapshotQuery {
+	filter := events.NewFilter(q.Service, q.Severity, q.Labels)
 	return snapshotQuery{
-		Service:  strings.TrimSpace(q.Service),
-		Severity: strings.ToLower(strings.TrimSpace(q.Severity)),
+		Service:  filter.Service(),
+		Severity: filter.Severity(),
 		Since:    q.Since,
 		Until:    q.Until,
-		Labels:   q.Labels,
+		Labels:   filter.Labels(),
 	}
 }
 
-// matches reports whether q, after the same normalization, is this filter
-// set. Time zones and label order are irrelevant; severity case and
-// surrounding whitespace are normalized away. An absent bound (nil) differs
-// from an explicit boundary, even one at the zero instant.
+// matches reports whether q normalizes to this filter set, using the same
+// events.Filter normalization every selection applies. Time zones and label
+// order are irrelevant; severity case and surrounding whitespace are
+// normalized away. An absent bound (nil) differs from an explicit boundary,
+// even one at the zero instant.
 func (sq snapshotQuery) matches(q events.Query) bool {
-	if sq.Service != strings.TrimSpace(q.Service) {
+	filter := events.NewFilter(q.Service, q.Severity, q.Labels)
+	if sq.Service != filter.Service() {
 		return false
 	}
-	if sq.Severity != strings.ToLower(strings.TrimSpace(q.Severity)) {
+	if sq.Severity != filter.Severity() {
 		return false
 	}
 	if !timePtrEqual(sq.Since, q.Since) || !timePtrEqual(sq.Until, q.Until) {
 		return false
 	}
-	return maps.Equal(sq.Labels, q.Labels)
+	return maps.Equal(sq.Labels, filter.Labels())
 }
 
 // equal compares two stored filter sets, used to cross-check a cursor

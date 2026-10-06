@@ -2,7 +2,6 @@ package events
 
 import (
 	"errors"
-	"strings"
 	"time"
 )
 
@@ -78,21 +77,14 @@ func (t *Timeline) Compare(query CompareQuery) (CompareResult, error) {
 		return CompareResult{}, err
 	}
 
-	service := strings.TrimSpace(query.Service)
-	severity := strings.ToLower(strings.TrimSpace(query.Severity))
+	filter := NewFilter(query.Service, query.Severity, query.Labels)
 
 	baselineCounts := make([]int, len(segments))
 	observationCounts := make([]int, len(segments))
 
 	t.mu.RLock()
 	for _, event := range t.events {
-		if service != "" && event.Service != service {
-			continue
-		}
-		if severity != "" && event.Severity != severity {
-			continue
-		}
-		if !labelsMatch(event.Labels, query.Labels) {
+		if !filter.Matches(event) {
 			continue
 		}
 		if i, ok := bucketIndex(event.At, query.BaselineSince, query.BaselineUntil, query.Step); ok {
