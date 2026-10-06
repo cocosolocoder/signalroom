@@ -57,8 +57,10 @@ type frameLog struct {
 // already-locked data directory, replays its frames with decode, and
 // truncates at most one incomplete trailing frame. A corrupt frame in the
 // middle, or a complete frame whose payload decode rejects, is fatal and
-// leaves the file untouched.
-func openFrameLog[T any](dir, name, noun, unit string, decode func(payload []byte) (T, error)) (*frameLog, []T, error) {
+// leaves the file untouched. When check is non-nil it validates the
+// recovered items after replay and before any truncation, so a rejection
+// there is also fatal without modifying a single byte of the file.
+func openFrameLog[T any](dir, name, noun, unit string, decode func(payload []byte) (T, error), check func(items []T) error) (*frameLog, []T, error) {
 	path := filepath.Join(dir, name)
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
 	if err != nil {
@@ -69,6 +71,12 @@ func openFrameLog[T any](dir, name, noun, unit string, decode func(payload []byt
 	if err != nil {
 		file.Close()
 		return nil, nil, err
+	}
+	if check != nil {
+		if err := check(items); err != nil {
+			file.Close()
+			return nil, nil, err
+		}
 	}
 	if info, statErr := file.Stat(); statErr == nil && validLen < info.Size() {
 		// Drop exactly one incomplete trailing frame; the only mutation

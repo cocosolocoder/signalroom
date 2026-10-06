@@ -1,6 +1,7 @@
 package logfile
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"hash/crc32"
@@ -218,6 +219,101 @@ func TestReplayFailsOnCompleteIllegalFrame(t *testing.T) {
 	}
 	if _, _, err := Open(dir); !isCorruption(err) {
 		t.Fatalf("empty frame must fail startup, got %v", err)
+	}
+}
+
+func TestReplayFailsOnConflictWithoutMutation(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, logName)
+
+	// Two complete batches disagree on the content of event "dup"; a torn
+	// frame trails them. The conflict must be detected before the tail is
+	// touched.
+	first := frameFor([]byte(`[{"id":"ok","service":"svc","severity":"info","message":"m","at":"2026-10-01T09:00:00Z"}]`))
+	second := frameFor([]byte(`[{"id":"dup","service":"svc","severity":"info","message":"first","at":"2026-10-01T09:01:00Z"}]`))
+	third := frameFor([]byte(`[{"id":"dup","service":"svc","severity":"info","message":"second","at":"2026-10-01T09:01:00Z"}]`))
+	tornPayload := []byte(`[{"id":"torn","service":"svc","severity":"info","message":"m","at":"2026-10-01T09:02:00Z"}]`)
+	torn := frameFor(tornPayload)[:headerSize+3]
+
+	content := append(append(append(append([]byte(nil), first...), second...), third...), torn...)
+	if err := os.WriteFile(path, content, 0o644); err != nil {
+		t.Fatalf("seed conflicting log: %v", err)
+	}
+
+	log, _, err := Open(dir)
+	if err == nil {
+		log.Close()
+		t.Fatal("conflicting complete records must fail startup")
+	}
+	if !events.IsConflictError(err) {
+		t.Fatalf("want a conflict error, got %v", err)
+	}
+	if !strings.Contains(err.Error(), `"dup"`) {
+		t.Fatalf("error must name the conflicting id: %v", err)
+	}
+	after, _ := os.ReadFile(path)
+	if !bytes.Equal(after, content) {
+		t.Fatal("failed startup must not modify the log, torn tail included")
+	}
+}
+
+func TestReplayFailsOnConflictWithinOneBatch(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, logName)
+
+	// The clash sits inside a single complete batch; a torn tail follows.
+	batch := frameFor([]byte(`[{"id":"dup","service":"svc","severity":"info","message":"one","at":"2026-10-01T09:00:00Z"},` +
+		`{"id":"dup","service":"svc","severity":"info","message":"two","at":"2026-10-01T09:00:00Z"}]`))
+	torn := make([]byte, 5)
+	binary.BigEndian.PutUint32(torn[0:4], 100)
+	content := append(append([]byte(nil), batch...), torn...)
+	if err := os.WriteFile(path, content, 0o644); err != nil {
+		t.Fatalf("seed conflicting log: %v", err)
+	}
+
+	log, _, err := Open(dir)
+	if err == nil {
+		log.Close()
+		t.Fatal("intra-batch conflict must fail startup")
+	}
+	if !events.IsConflictError(err) || !strings.Contains(err.Error(), `"dup"`) {
+		t.Fatalf("want conflict naming the id, got %v", err)
+	}
+	if after, _ := os.ReadFile(path); !bytes.Equal(after, content) {
+		t.Fatal("failed startup must not modify the log")
+	}
+}
+
+func TestReplayToleratesEquivalentDuplicates(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, logName)
+
+	// The same event spelled differently across two complete batches: time
+	// zone offset, label order, and null/absent/empty labels are not
+	// conflicts. A torn tail still gets trimmed.
+	first := frameFor([]byte(`[{"id":"e1","service":"svc","severity":"INFO","message":"m","at":"2026-10-01T09:00:00Z","labels":{"env":"prod","version":"v2"}}]`))
+	second := frameFor([]byte(`[{"id":"e1","service":"svc","severity":"info","message":"m","at":"2026-10-01T11:00:00+02:00","labels":{"version":"v2","env":"prod"}},` +
+		`{"id":"e2","service":"svc","severity":"info","message":"n","at":"2026-10-01T09:05:00Z","labels":null},` +
+		`{"id":"e3","service":"svc","severity":"info","message":"o","at":"2026-10-01T09:06:00Z","labels":{}}]`))
+	third := frameFor([]byte(`[{"id":"e2","service":"svc","severity":"info","message":"n","at":"2026-10-01T09:05:00Z"}]`))
+	tornPayload := []byte(`[{"id":"torn","service":"svc","severity":"info","message":"m","at":"2026-10-01T09:07:00Z"}]`)
+	torn := frameFor(tornPayload)[:headerSize+4]
+	content := append(append(append(append([]byte(nil), first...), second...), third...), torn...)
+	if err := os.WriteFile(path, content, 0o644); err != nil {
+		t.Fatalf("seed log: %v", err)
+	}
+
+	log, batches, err := Open(dir)
+	if err != nil {
+		t.Fatalf("equivalent duplicates must recover: %v", err)
+	}
+	defer log.Close()
+	if len(batches) != 3 {
+		t.Fatalf("all complete batches must be returned, got %d", len(batches))
+	}
+	// The torn tail was trimmed once recovery proved consistent.
+	if info, err := os.Stat(path); err != nil || info.Size() != int64(len(content)-len(torn)) {
+		t.Fatalf("torn tail must be trimmed after a consistent recovery: %v", err)
 	}
 }
 

@@ -137,7 +137,8 @@ func (t *Timeline) Ingest(batch []Event, beforeCommit BeforeCommit) (IngestResul
 
 // Load inserts events recovered from durable storage during startup. Every
 // event must already be normalized; a duplicate id with differing content is
-// reported as a conflict so the caller can fail rather than mutate data.
+// reported as a conflict naming the id, so the caller can fail rather than
+// mutate data.
 func (t *Timeline) Load(event Event) error {
 	if _, err := Normalize(event); err != nil {
 		return err
@@ -146,7 +147,7 @@ func (t *Timeline) Load(event Event) error {
 	defer t.mu.Unlock()
 	if existing, ok := t.byID[event.ID]; ok {
 		if !sameEvent(existing, event) {
-			return &ConflictError{Reason: "event id already exists with different content"}
+			return &ConflictError{Reason: fmt.Sprintf("event id %q already exists with different content", event.ID)}
 		}
 		return nil
 	}

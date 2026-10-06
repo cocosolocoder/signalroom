@@ -499,6 +499,96 @@ func TestServeFailsOnMidCorruptionWithoutMutation(t *testing.T) {
 	}
 }
 
+func TestServeFailsOnConflictWithoutMutation(t *testing.T) {
+	dataDir := t.TempDir()
+
+	// Two complete batches carry the same event id with different content,
+	// and a torn frame trails them. Startup must fail before the tail is
+	// trimmed.
+	frame := func(payload string) []byte {
+		raw := []byte(payload)
+		out := make([]byte, 8+len(raw))
+		binary.BigEndian.PutUint32(out[0:4], uint32(len(raw)))
+		binary.BigEndian.PutUint32(out[4:8], crc32.ChecksumIEEE(raw))
+		copy(out[8:], raw)
+		return out
+	}
+	first := frame(`[{"id":"e1","service":"svc","severity":"info","message":"first","at":"2026-10-01T09:00:00Z"}]`)
+	second := frame(`[{"id":"e1","service":"svc","severity":"info","message":"second","at":"2026-10-01T09:00:00Z"}]`)
+	tornPayload := []byte(`[{"id":"torn","service":"svc","severity":"info","message":"m","at":"2026-10-01T09:01:00Z"}]`)
+	torn := frame(string(tornPayload))[:8+4]
+	content := append(append(append([]byte(nil), first...), second...), torn...)
+	path := filepath.Join(dataDir, "events.log")
+	if err := os.WriteFile(path, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	logs := &safeBuffer{}
+	failing := exec.Command(binaryPath, "serve", "--addr", "127.0.0.1:0", "--data", dataDir)
+	failing.Stdout = logs
+	failing.Stderr = logs
+	if err := failing.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- failing.Wait() }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("conflicting log must prevent startup")
+		}
+		if ee, ok := err.(*exec.ExitError); !ok || ee.ExitCode() == 0 {
+			t.Fatalf("conflicting log must exit non-zero: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		failing.Process.Kill()
+		t.Fatal("server stayed up despite conflicting records")
+	}
+
+	out := logs.String()
+	if !strings.Contains(out, `"e1"`) || !strings.Contains(out, "different content") {
+		t.Fatalf("error must name the conflicting id and the content clash:\n%s", out)
+	}
+	if strings.Contains(out, "listening on") {
+		t.Fatalf("failed startup must not announce readiness:\n%s", out)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, content) {
+		t.Fatal("failed startup must not modify events.log, torn tail included")
+	}
+}
+
+func TestServeRecoversIdenticalDuplicateRecords(t *testing.T) {
+	dataDir := t.TempDir()
+
+	// The same event recorded in two complete batches (e.g. a confirmed
+	// batch retried before a crash) recovers as a single event.
+	frame := func(payload string) []byte {
+		raw := []byte(payload)
+		out := make([]byte, 8+len(raw))
+		binary.BigEndian.PutUint32(out[0:4], uint32(len(raw)))
+		binary.BigEndian.PutUint32(out[4:8], crc32.ChecksumIEEE(raw))
+		copy(out[8:], raw)
+		return out
+	}
+	event := `{"id":"e1","service":"svc","severity":"info","message":"m","at":"2026-10-01T09:00:00Z"}`
+	content := append(frame(`[`+event+`]`), frame(`[`+event+`]`)...)
+	if err := os.WriteFile(filepath.Join(dataDir, "events.log"), content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	p := startServer(t, dataDir)
+	got := getEvents(t, p, "")
+	if len(got) != 1 || got[0]["id"] != "e1" {
+		t.Fatalf("identical duplicates must recover as one event: %+v", got)
+	}
+	p.signal(t, syscall.SIGTERM)
+	p.waitExit(t, 0)
+}
+
 func TestServeHTTPErrorsAreJSON(t *testing.T) {
 	p := startServer(t, t.TempDir())
 	status, raw := httpDo(t, http.MethodPost, "http://"+p.addr+"/events", `{"events":[]}`)

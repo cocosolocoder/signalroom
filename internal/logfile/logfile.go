@@ -32,9 +32,10 @@ type Log struct {
 
 // Open acquires an exclusive lock on the data directory, creates it if
 // needed, replays the log, and truncates at most one incomplete trailing
-// frame (a torn final write). A corrupt frame in the middle, or a complete
-// frame containing illegal data, is fatal: Open returns an error without
-// modifying the file.
+// frame (a torn final write). A corrupt frame in the middle, a complete
+// frame containing illegal data, or two complete records carrying the same
+// event id with different normalized content, is fatal: Open returns an
+// error without modifying the file, torn tail included.
 //
 // Recovered batches are returned in write order, ready to load into a
 // timeline.
@@ -59,7 +60,7 @@ func Open(dir string) (*Log, [][]events.Event, error) {
 		return nil, nil, fmt.Errorf("acquire directory lock: %w", err)
 	}
 
-	base, batches, err := openFrameLog(dir, logName, "event", "batch", decodeEventBatch)
+	base, batches, err := openFrameLog(dir, logName, "event", "batch", decodeEventBatch, checkEventConflicts)
 	if err != nil {
 		unlock(lockFile)
 		lockFile.Close()
@@ -95,6 +96,25 @@ func decodeEventBatch(payload []byte) ([]events.Event, error) {
 		batch[i] = normalized
 	}
 	return batch, nil
+}
+
+// checkEventConflicts rejects a recovered log in which the same event id
+// carries different normalized content, whether the clash sits inside one
+// batch or across batches. It reuses the timeline's own recovery rules, so
+// the comparison (trimmed strings, case-folded severity, absolute instants,
+// order-independent labels) matches what serving would apply, and identical
+// repeats collapse to one copy. It runs before any torn-tail truncation, so
+// a conflicting log keeps every byte it had before startup.
+func checkEventConflicts(batches [][]events.Event) error {
+	recovered := events.NewTimeline()
+	for _, batch := range batches {
+		for _, event := range batch {
+			if err := recovered.Load(event); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // Append durably writes one batch. The bytes hit the disk (write followed by
