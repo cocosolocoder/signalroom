@@ -382,9 +382,16 @@ Accepted metric batches are fsynced in their own `metrics.log` before the
 success response, under the same durability and recovery rules as
 `events.log` and `incidents.log`: confirmed samples survive a restart or a
 kill, only an incomplete trailing batch is discarded, and any other
-corruption prevents startup without modifying the data. A failed metric write
-poisons only metric handling; events and incidents keep working. Old data
-directories without `metrics.log` start unchanged.
+corruption prevents startup without modifying the data. In addition, startup
+fails with a non-zero status — before serving and without truncating a single
+byte, an unfinished trailing write included — when the complete, valid
+records contradict each other: one sample id carrying different normalized
+content, or two different ids occupying the same instant of one series
+(service, metric name, and the complete label set), inside one batch or
+across batches. Identical id/content repeats stay legal and recover as one
+sample, so only a consistent history drops its torn tail and starts normally.
+A failed metric write poisons only metric handling; events and incidents keep
+working. Old data directories without `metrics.log` start unchanged.
 
 ### POST /incidents
 

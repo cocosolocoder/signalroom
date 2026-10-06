@@ -1,8 +1,10 @@
 package logfile
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -158,5 +160,193 @@ func TestMetricsLogFailurePoisons(t *testing.T) {
 	}
 	if err := mLog.Append([]metrics.Sample{metricSample("y", 12, 1)}); err == nil {
 		t.Fatal("poisoned log must keep failing")
+	}
+}
+
+// writeRawMetricsLog seeds the directory with a metrics.log made of the given
+// prebuilt frames and returns every byte written.
+func writeRawMetricsLog(t *testing.T, dir string, frames ...[]byte) []byte {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var content []byte
+	for _, frame := range frames {
+		content = append(content, frame...)
+	}
+	if err := os.WriteFile(filepath.Join(dir, metricsLogName), content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return content
+}
+
+// openDirForMetrics acquires the directory lock the way startup does, so the
+// metrics open attempt sees the same state as serving.
+func openDirForMetrics(t *testing.T, dir string) *Log {
+	t.Helper()
+	eventLog, _, err := Open(dir)
+	if err != nil {
+		t.Fatalf("open dir: %v", err)
+	}
+	return eventLog
+}
+
+func TestMetricsLogFailsOnIDConflictAcrossBatchesWithoutMutation(t *testing.T) {
+	dir := t.TempDir()
+	// Two complete, individually readable batches disagree on id "dup"; a
+	// torn frame trails them. The clash must be rejected before the tail is
+	// trimmed, leaving every byte in place.
+	first := frameFor([]byte(`[{"id":"dup","service":"gw","name":"requests","at":"2026-10-01T00:00:10Z","value":1}]`))
+	second := frameFor([]byte(`[{"id":"dup","service":"gw","name":"requests","at":"2026-10-01T00:00:10Z","value":2}]`))
+	tornPayload := []byte(`[{"id":"torn","service":"gw","name":"requests","at":"2026-10-01T00:00:11Z","value":3}]`)
+	torn := frameFor(tornPayload)[:headerSize+4]
+	content := writeRawMetricsLog(t, dir, first, second, torn)
+
+	eventLog := openDirForMetrics(t, dir)
+	defer eventLog.Close()
+	if _, _, err := OpenMetricsLog(dir); err == nil {
+		t.Fatal("conflicting metric history must fail startup")
+	} else {
+		if !metrics.IsConflictError(err) {
+			t.Fatalf("want a conflict error, got %v", err)
+		}
+		if !strings.Contains(err.Error(), "conflicting samples") {
+			t.Fatalf("error must state metric history has sample conflicts: %v", err)
+		}
+	}
+	if after, err := os.ReadFile(filepath.Join(dir, metricsLogName)); err != nil || !bytes.Equal(after, content) {
+		t.Fatalf("failed startup must not modify the log, torn tail included: %v", err)
+	}
+}
+
+func TestMetricsLogFailsOnConflictWithoutTornTail(t *testing.T) {
+	dir := t.TempDir()
+	// No unfinished suffix at all: the rejection must be identical.
+	first := frameFor([]byte(`[{"id":"dup","service":"gw","name":"requests","at":"2026-10-01T00:00:10Z","value":1}]`))
+	second := frameFor([]byte(`[{"id":"dup","service":"gw","name":"requests","at":"2026-10-01T00:00:10Z","value":2}]`))
+	content := writeRawMetricsLog(t, dir, first, second)
+
+	eventLog := openDirForMetrics(t, dir)
+	defer eventLog.Close()
+	_, _, err := OpenMetricsLog(dir)
+	if err == nil {
+		t.Fatal("conflicting complete records must fail startup even without a torn tail")
+	}
+	if !metrics.IsConflictError(err) {
+		t.Fatalf("want a conflict error, got %v", err)
+	}
+	if after, err := os.ReadFile(filepath.Join(dir, metricsLogName)); err != nil || !bytes.Equal(after, content) {
+		t.Fatalf("failed startup must not modify the log: %v", err)
+	}
+}
+
+func TestMetricsLogFailsOnSeriesTimeConflictWithinOneBatch(t *testing.T) {
+	dir := t.TempDir()
+	// Two different ids claim the exact same (service, name, labels, time)
+	// point inside one complete batch, even though the readings are equal.
+	clash := frameFor([]byte(`[` +
+		`{"id":"a","service":"gw","name":"requests","at":"2026-10-01T00:00:10Z","value":5},` +
+		`{"id":"b","service":"gw","name":"requests","at":"2026-10-01T00:00:10Z","value":5}` +
+		`]`))
+	tornPayload := []byte(`[{"id":"torn","service":"gw","name":"requests","at":"2026-10-01T00:00:11Z","value":3}]`)
+	torn := frameFor(tornPayload)[:headerSize+2]
+	content := writeRawMetricsLog(t, dir, clash, torn)
+
+	eventLog := openDirForMetrics(t, dir)
+	defer eventLog.Close()
+	_, _, err := OpenMetricsLog(dir)
+	if err == nil {
+		t.Fatal("a series/time clash inside one batch must fail startup")
+	}
+	if !metrics.IsConflictError(err) {
+		t.Fatalf("want a conflict error, got %v", err)
+	}
+	if after, err := os.ReadFile(filepath.Join(dir, metricsLogName)); err != nil || !bytes.Equal(after, content) {
+		t.Fatalf("failed startup must not modify the log, torn tail included: %v", err)
+	}
+}
+
+func TestMetricsLogFailsOnSeriesTimeConflictAcrossBatches(t *testing.T) {
+	dir := t.TempDir()
+	// Each batch reads on its own; only the cross-batch view exposes that
+	// two different ids occupy one sampling position of one series.
+	first := frameFor([]byte(`[{"id":"a","service":"gw","name":"requests","at":"2026-10-01T00:00:10Z","value":5}]`))
+	second := frameFor([]byte(`[{"id":"b","service":"gw","name":"requests","at":"2026-10-01T00:00:10Z","value":9}]`))
+	content := writeRawMetricsLog(t, dir, first, second)
+
+	eventLog := openDirForMetrics(t, dir)
+	defer eventLog.Close()
+	_, _, err := OpenMetricsLog(dir)
+	if err == nil {
+		t.Fatal("a series/time clash across batches must fail startup")
+	}
+	if !metrics.IsConflictError(err) {
+		t.Fatalf("want a conflict error, got %v", err)
+	}
+	if after, err := os.ReadFile(filepath.Join(dir, metricsLogName)); err != nil || !bytes.Equal(after, content) {
+		t.Fatalf("failed startup must not modify the log: %v", err)
+	}
+}
+
+func TestMetricsLogToleratesEquivalentDuplicates(t *testing.T) {
+	dir := t.TempDir()
+	// The same sample spelled differently across complete batches: timezone
+	// offset, label order, surrounding whitespace, and 1 vs 1.0 are not
+	// conflicts. Identical repeats collapse to one sample. A torn tail still
+	// gets trimmed.
+	first := frameFor([]byte(`[` +
+		`{"id":"m1","service":" gw ","name":"requests","at":"2026-10-01T02:00:00+02:00","value":1,"labels":{"env":"prod","version":"v2"}},` +
+		`{"id":"m2","service":"gw","name":"requests","at":"2026-10-01T00:00:11Z","value":2}` +
+		`]`))
+	second := frameFor([]byte(`[` +
+		`{"id":"m1","service":"gw","name":" requests ","at":"2026-10-01T00:00:00Z","value":1.0,"labels":{"version":"v2","env":"prod"}},` +
+		`{"id":"m2","service":"gw","name":"requests","at":"2026-10-01T00:00:11Z","value":2}` +
+		`]`))
+	tornPayload := []byte(`[{"id":"torn","service":"gw","name":"requests","at":"2026-10-01T00:00:12Z","value":3}]`)
+	torn := frameFor(tornPayload)[:headerSize+4]
+	content := writeRawMetricsLog(t, dir, first, second, torn)
+
+	eventLog := openDirForMetrics(t, dir)
+	defer eventLog.Close()
+	mLog, batches, err := OpenMetricsLog(dir)
+	if err != nil {
+		t.Fatalf("equivalent duplicates must recover: %v", err)
+	}
+	defer mLog.Close()
+	if len(batches) != 2 {
+		t.Fatalf("both complete batches must be returned, got %d", len(batches))
+	}
+	recovered := metrics.NewStore()
+	for _, batch := range batches {
+		for _, sample := range batch {
+			if err := recovered.Load(sample); err != nil {
+				t.Fatalf("equivalent repeats must collapse: %v", err)
+			}
+		}
+	}
+	if info, err := os.Stat(filepath.Join(dir, metricsLogName)); err != nil || info.Size() != int64(len(content)-len(torn)) {
+		t.Fatalf("torn tail must be trimmed after a consistent recovery, got %v", err)
+	}
+}
+
+func TestMetricsLogDistinguishesNearbyPointsAndLabelSets(t *testing.T) {
+	dir := t.TempDir()
+	// One nanosecond apart is a different position; a different complete
+	// label set is a different series even at the same instant. Neither is a
+	// conflict.
+	samePoint := frameFor([]byte(`[{"id":"m1","service":"gw","name":"requests","at":"2026-10-01T00:00:10Z","value":1}]`))
+	oneNanoLater := frameFor([]byte(`[{"id":"m2","service":"gw","name":"requests","at":"2026-10-01T00:00:10.000000001Z","value":1}]`))
+	otherSeries := frameFor([]byte(`[{"id":"m3","service":"gw","name":"requests","at":"2026-10-01T00:00:10Z","value":1,"labels":{"env":"prod"}}]`))
+	writeRawMetricsLog(t, dir, samePoint, oneNanoLater, otherSeries)
+
+	eventLog := openDirForMetrics(t, dir)
+	defer eventLog.Close()
+	mLog, batches, err := OpenMetricsLog(dir)
+	if err != nil {
+		t.Fatalf("distinct positions/series must recover: %v", err)
+	}
+	defer mLog.Close()
+	if len(batches) != 3 {
+		t.Fatalf("all three batches must recover, got %d", len(batches))
 	}
 }

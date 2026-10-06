@@ -1,14 +1,18 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"hash/crc32"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
+	"time"
 )
 
 // putFrame writes the shared length-prefixed, CRC-checked frame layout into a
@@ -352,6 +356,150 @@ func TestServeMetricsLegacyDataDirStarts(t *testing.T) {
 	// Events still readable.
 	if len(getEvents(t, p, "")) != 1 {
 		t.Fatal("legacy events must remain readable")
+	}
+	p.signal(t, syscall.SIGTERM)
+	p.waitExit(t, 0)
+}
+
+// metricFrame builds one complete length-prefixed, CRC-checked metrics frame.
+func metricFrame(payload string) []byte {
+	raw := []byte(payload)
+	out := make([]byte, 8+len(raw))
+	binary.BigEndian.PutUint32(out[0:4], uint32(len(raw)))
+	binary.BigEndian.PutUint32(out[4:8], crc32.ChecksumIEEE(raw))
+	copy(out[8:], raw)
+	return out
+}
+
+// startExpectingMetricsFailure runs serve against a data directory whose
+// metrics.log is expected to make recovery fail, asserts a non-zero exit
+// before readiness, and returns what the process printed.
+func startExpectingMetricsFailure(t *testing.T, dataDir string) string {
+	t.Helper()
+	logs := &safeBuffer{}
+	failing := exec.Command(binaryPath, "serve", "--addr", "127.0.0.1:0", "--data", dataDir)
+	failing.Stdout = logs
+	failing.Stderr = logs
+	if err := failing.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- failing.Wait() }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("conflicting metric history must prevent startup")
+		}
+		if ee, ok := err.(*exec.ExitError); !ok || ee.ExitCode() == 0 {
+			t.Fatalf("conflicting metric history must exit non-zero: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		failing.Process.Kill()
+		t.Fatal("server stayed up despite conflicting metric history")
+	}
+	return logs.String()
+}
+
+func TestServeMetricsFailsOnConflictAndKeepsTornTail(t *testing.T) {
+	dataDir := t.TempDir()
+
+	// Two complete, individually readable metric batches disagree on id
+	// "dup"; an unfinished frame trails them. Startup must fail non-zero,
+	// never listen, explain the conflict, and leave metrics.log byte-for-byte
+	// as it was — torn tail included.
+	first := metricFrame(`[{"id":"dup","service":"gw","name":"requests","at":"2026-10-01T00:00:10Z","value":1}]`)
+	second := metricFrame(`[{"id":"dup","service":"gw","name":"requests","at":"2026-10-01T00:00:10Z","value":2}]`)
+	tornPayload := []byte(`[{"id":"torn","service":"gw","name":"requests","at":"2026-10-01T00:00:11Z","value":3}]`)
+	torn := metricFrame(string(tornPayload))[:8+4]
+	content := append(append(append([]byte(nil), first...), second...), torn...)
+	path := filepath.Join(dataDir, "metrics.log")
+	if err := os.WriteFile(path, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	out := startExpectingMetricsFailure(t, dataDir)
+	if !strings.Contains(out, "conflicting samples") {
+		t.Fatalf("error must state metric history has sample conflicts:\n%s", out)
+	}
+	if strings.Contains(out, "listening on") {
+		t.Fatalf("failed startup must not announce readiness:\n%s", out)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, content) {
+		t.Fatal("failed startup must not modify metrics.log, torn tail included")
+	}
+}
+
+func TestServeMetricsFailsOnSeriesTimeConflictAcrossBatches(t *testing.T) {
+	dataDir := t.TempDir()
+
+	// Each batch is readable on its own; only the recovered whole shows two
+	// different ids occupying one (service, name, labels, time) position,
+	// even though their readings agree. No torn tail this time.
+	first := metricFrame(`[{"id":"a","service":"gw","name":"requests","at":"2026-10-01T00:00:10Z","value":5}]`)
+	second := metricFrame(`[{"id":"b","service":"gw","name":"requests","at":"2026-10-01T00:00:10Z","value":5}]`)
+	content := append(append([]byte(nil), first...), second...)
+	path := filepath.Join(dataDir, "metrics.log")
+	if err := os.WriteFile(path, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	out := startExpectingMetricsFailure(t, dataDir)
+	if !strings.Contains(out, "conflicting samples") {
+		t.Fatalf("error must state metric history has sample conflicts:\n%s", out)
+	}
+	if after, err := os.ReadFile(path); err != nil || !bytes.Equal(after, content) {
+		t.Fatalf("failed startup must not modify metrics.log: %v", err)
+	}
+}
+
+func TestServeMetricsRecoversEquivalentDuplicatesAndTrimsTornTail(t *testing.T) {
+	dataDir := t.TempDir()
+
+	// Timezone spelling, label order, surrounding whitespace, and 1 vs 1.0
+	// never clash; identical id/content repeats count once. With the history
+	// consistent, the one torn trailing frame is dropped and startup proceeds
+	// normally.
+	first := metricFrame(`[` +
+		`{"id":"m1","service":" gw ","name":"requests","at":"2026-10-01T02:00:00+02:00","value":1,"labels":{"env":"prod","version":"v2"}},` +
+		`{"id":"m2","service":"gw","name":"requests","at":"2026-10-01T00:00:11Z","value":2}` +
+		`]`)
+	second := metricFrame(`[` +
+		`{"id":"m1","service":"gw","name":" requests ","at":"2026-10-01T00:00:00Z","value":1.0,"labels":{"version":"v2","env":"prod"}},` +
+		`{"id":"m2","service":"gw","name":"requests","at":"2026-10-01T00:00:11Z","value":2}` +
+		`]`)
+	tornPayload := []byte(`[{"id":"torn","service":"gw","name":"requests","at":"2026-10-01T00:00:12Z","value":3}]`)
+	torn := metricFrame(string(tornPayload))[:8+4]
+	content := append(append(append([]byte(nil), first...), second...), torn...)
+	path := filepath.Join(dataDir, "metrics.log")
+	if err := os.WriteFile(path, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	p := startServer(t, dataDir)
+	status, got := metricAggregate(t, p,
+		"?name=requests&service=gw&since=2026-10-01T00:00:00Z&until=2026-10-01T00:00:12Z&step=60")
+	if status != http.StatusOK {
+		t.Fatalf("consistent history must start and aggregate: %d %v", status, got)
+	}
+	// Two series (labeled and unlabeled); each repeat collapses to one sample.
+	if len(got) != 2 {
+		t.Fatalf("two series recover, got %d: %v", len(got), got)
+	}
+	for _, series := range got {
+		var count int
+		for _, seg := range series["segments"].([]any) {
+			count += int(seg.(map[string]any)["count"].(float64))
+		}
+		if count != 1 {
+			t.Fatalf("each series must hold one deduplicated sample, got %d: %v", count, got)
+		}
+	}
+	if info, err := os.Stat(path); err != nil || info.Size() != int64(len(content)-len(torn)) {
+		t.Fatalf("torn tail must be trimmed on consistent recovery, got %v", err)
 	}
 	p.signal(t, syscall.SIGTERM)
 	p.waitExit(t, 0)
