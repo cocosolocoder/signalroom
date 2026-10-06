@@ -4,10 +4,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
 	"time"
 
 	"github.com/cocosolocoder/signalroom/internal/events"
+	"github.com/cocosolocoder/signalroom/internal/strictjson"
 )
 
 // sampleDTO is the on-disk representation of a normalized sample. Timestamps
@@ -64,20 +64,11 @@ func MarshalBatch(batch []Sample) ([]byte, error) {
 // labels, and trailing data are all rejected; callers remain responsible for
 // the empty-array check and content validation.
 func DecodeBatch(data []byte) ([]Sample, error) {
-	dec := json.NewDecoder(bytes.NewReader(data))
-	open, err := dec.Token()
-	if err != nil {
-		return nil, fmt.Errorf("decode samples array: %w", err)
-	}
-	if delim, ok := open.(json.Delim); !ok || delim != '[' {
-		return nil, fmt.Errorf("decode samples array: must be an array")
-	}
-
 	var batch []Sample
-	for dec.More() {
+	err := strictjson.EachArrayElement(data, "decode samples array", func(dec *json.Decoder) error {
 		raw, err := decodeSample(dec)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		batch = append(batch, Sample{
 			ID:      raw.id,
@@ -87,57 +78,26 @@ func DecodeBatch(data []byte) ([]Sample, error) {
 			Value:   raw.value,
 			Labels:  raw.labels,
 		})
-	}
-	if _, err := dec.Token(); err != nil { // closing ']'
-		return nil, fmt.Errorf("decode samples array: %w", err)
-	}
-	var extra json.RawMessage
-	if err := dec.Decode(&extra); err != io.EOF {
-		if err == nil {
-			return nil, fmt.Errorf("decode samples array: unexpected trailing data")
-		}
-		return nil, fmt.Errorf("decode samples array: %w", err)
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return batch, nil
 }
 
-// decodeSample reads exactly one sample object, rejecting unknown and
-// duplicate members rather than letting a struct decode silently keep the
-// last value.
+// decodeSample reads exactly one sample object; the shared object walk
+// rejects unknown and duplicate members rather than letting a struct decode
+// silently keep the last value.
 func decodeSample(dec *json.Decoder) (rawSample, error) {
-	open, err := dec.Token()
-	if err != nil {
-		return rawSample{}, fmt.Errorf("decode sample: %w", err)
-	}
-	if delim, ok := open.(json.Delim); !ok || delim != '{' {
-		return rawSample{}, fmt.Errorf("decode sample: each sample must be an object")
-	}
-
 	var raw rawSample
 	var labelsRaw json.RawMessage
-	seen := make(map[string]struct{})
-	for dec.More() {
-		keyToken, err := dec.Token()
-		if err != nil {
-			return rawSample{}, fmt.Errorf("decode sample: %w", err)
-		}
-		key, ok := keyToken.(string)
-		if !ok {
-			return rawSample{}, fmt.Errorf("decode sample: field names must be strings")
-		}
-		if _, known := allowedSampleFields[key]; !known {
-			return rawSample{}, fmt.Errorf("decode sample: unknown field %q", key)
-		}
-		if _, dup := seen[key]; dup {
-			return rawSample{}, fmt.Errorf("decode sample: duplicate field %q", key)
-		}
-		seen[key] = struct{}{}
-
+	seen, err := strictjson.ObjectMembers(dec, "decode sample", allowedSampleFields, func(key string) error {
 		switch key {
 		case "id", "service", "name":
 			var value string
 			if err := dec.Decode(&value); err != nil {
-				return rawSample{}, fmt.Errorf("decode sample: %s must be a string", key)
+				return fmt.Errorf("decode sample: %s must be a string", key)
 			}
 			switch key {
 			case "id":
@@ -150,7 +110,7 @@ func decodeSample(dec *json.Decoder) (rawSample, error) {
 		case "at":
 			var at time.Time
 			if err := dec.Decode(&at); err != nil {
-				return rawSample{}, fmt.Errorf("decode sample: at must be an RFC3339Nano timestamp")
+				return fmt.Errorf("decode sample: at must be an RFC3339Nano timestamp")
 			}
 			raw.at = at
 		case "value":
@@ -159,25 +119,26 @@ func decodeSample(dec *json.Decoder) (rawSample, error) {
 			// the token to literally be a JSON number before parsing.
 			var token json.RawMessage
 			if err := dec.Decode(&token); err != nil {
-				return rawSample{}, fmt.Errorf("decode sample: value must be a JSON number")
+				return fmt.Errorf("decode sample: value must be a JSON number")
 			}
 			number := bytes.TrimSpace(token)
 			if !isJSONNumber(number) {
-				return rawSample{}, fmt.Errorf("decode sample: value must be a non-negative, finite JSON number")
+				return fmt.Errorf("decode sample: value must be a non-negative, finite JSON number")
 			}
 			value, err := json.Number(number).Float64()
 			if err != nil || !finiteNonNegative(value) {
-				return rawSample{}, fmt.Errorf("decode sample: value must be a non-negative, finite JSON number")
+				return fmt.Errorf("decode sample: value must be a non-negative, finite JSON number")
 			}
 			raw.value = value
 		case "labels":
 			if err := dec.Decode(&labelsRaw); err != nil {
-				return rawSample{}, fmt.Errorf("decode sample: labels must be an object")
+				return fmt.Errorf("decode sample: labels must be an object")
 			}
 		}
-	}
-	if _, err := dec.Token(); err != nil { // closing '}'
-		return rawSample{}, fmt.Errorf("decode sample: %w", err)
+		return nil
+	})
+	if err != nil {
+		return rawSample{}, err
 	}
 
 	labels, err := events.DecodeLabelsObject(labelsRaw)
