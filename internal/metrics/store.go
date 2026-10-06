@@ -279,12 +279,18 @@ func (s *Store) Load(sample Sample) error {
 	key := keyFor(sample)
 	if existing, ok := s.byID[sample.ID]; ok {
 		if !sameContent(existing, sample) {
-			return &ConflictError{Reason: "sample id already exists with different content"}
+			return &ConflictError{Reason: fmt.Sprintf("sample id %q already exists with different content", sample.ID)}
+		}
+		// An identical retry of one id must never mask another id's point.
+		if owner := s.series[key].pointOwner(sample.At); owner != "" && owner != sample.ID {
+			return &ConflictError{Reason: fmt.Sprintf(
+				"sample id %q collides with sample id %q at the same series and time", sample.ID, owner)}
 		}
 		return nil
 	}
 	if owner := s.series[key].pointOwner(sample.At); owner != "" {
-		return &ConflictError{Reason: "sample collides with a different sample of the same series at the same time"}
+		return &ConflictError{Reason: fmt.Sprintf(
+			"sample id %q collides with sample id %q at the same series and time", sample.ID, owner)}
 	}
 	s.byID[sample.ID] = sample
 	state := s.series[key]

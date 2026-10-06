@@ -1,14 +1,18 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"hash/crc32"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
+	"time"
 )
 
 // putFrame writes the shared length-prefixed, CRC-checked frame layout into a
@@ -355,4 +359,126 @@ func TestServeMetricsLegacyDataDirStarts(t *testing.T) {
 	}
 	p.signal(t, syscall.SIGTERM)
 	p.waitExit(t, 0)
+}
+
+// metricConflictFrame builds a complete length-prefixed, CRC-checked frame
+// around a raw metric JSON payload (putFrame in this file already handles the
+// shared layout).
+func metricConflictFrame(t *testing.T, payload string) []byte {
+	t.Helper()
+	raw := []byte(payload)
+	frame := make([]byte, 8+len(raw))
+	putFrame(frame, raw)
+	return frame
+}
+
+// TestServeMetricsConflictFailsStartupWithoutMutation proves the startup
+// contract: when complete, valid records clash (same id with different
+// content here, a torn frame trailing them), the process exits non-zero
+// before serving HTTP, the error names the metrics sample conflict, and
+// metrics.log keeps every byte it had before startup — the torn tail is not
+// trimmed, so the operator still has the complete original history.
+func TestServeMetricsConflictFailsStartupWithoutMutation(t *testing.T) {
+	dataDir := t.TempDir()
+
+	first := metricConflictFrame(t, `[{"id":"m1","service":"gw","name":"requests","at":"2026-10-01T10:00:00Z","value":1}]`)
+	second := metricConflictFrame(t, `[{"id":"m1","service":"gw","name":"requests","at":"2026-10-01T10:00:00Z","value":2}]`)
+	tornPayload := []byte(`[{"id":"torn","service":"gw","name":"requests","at":"2026-10-01T10:02:00Z","value":9}]`)
+	torn := metricConflictFrame(t, string(tornPayload))[:8+4]
+	content := append(append(append([]byte(nil), first...), second...), torn...)
+	path := filepath.Join(dataDir, "metrics.log")
+	if err := os.WriteFile(path, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	logs := &safeBuffer{}
+	failing := exec.Command(binaryPath, "serve", "--addr", "127.0.0.1:0", "--data", dataDir)
+	failing.Stdout = logs
+	failing.Stderr = logs
+	if err := failing.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- failing.Wait() }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("conflicting metrics history must prevent startup")
+		}
+		if ee, ok := err.(*exec.ExitError); !ok || ee.ExitCode() == 0 {
+			t.Fatalf("conflicting metrics history must exit non-zero: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		failing.Process.Kill()
+		t.Fatal("server stayed up despite conflicting metric records")
+	}
+
+	out := logs.String()
+	if !strings.Contains(out, "sample conflict") {
+		t.Fatalf("error must state the metrics history has a sample conflict:\n%s", out)
+	}
+	if !strings.Contains(out, `"m1"`) {
+		t.Fatalf("error must name the conflicting sample id:\n%s", out)
+	}
+	if strings.Contains(out, "listening on") {
+		t.Fatalf("failed startup must not announce readiness:\n%s", out)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, content) {
+		t.Fatal("failed startup must not modify metrics.log, torn tail included")
+	}
+}
+
+// TestServeMetricsSeriesTimeConflictFailsStartupWithoutMutation covers the
+// other clash shape end to end: two different ids, identical readings, on
+// the same series at the same instant, split across two complete batches —
+// no torn tail this time. Startup refuses identically and the file is
+// unchanged.
+func TestServeMetricsSeriesTimeConflictFailsStartupWithoutMutation(t *testing.T) {
+	dataDir := t.TempDir()
+
+	first := metricConflictFrame(t, `[{"id":"m1","service":"gw","name":"requests","at":"2026-10-01T10:00:00Z","value":7}]`)
+	second := metricConflictFrame(t, `[{"id":"m2","service":"gw","name":"requests","at":"2026-10-01T10:00:00Z","value":7}]`)
+	content := append(append([]byte(nil), first...), second...)
+	path := filepath.Join(dataDir, "metrics.log")
+	if err := os.WriteFile(path, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	logs := &safeBuffer{}
+	failing := exec.Command(binaryPath, "serve", "--addr", "127.0.0.1:0", "--data", dataDir)
+	failing.Stdout = logs
+	failing.Stderr = logs
+	if err := failing.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- failing.Wait() }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("conflicting metrics history must prevent startup")
+		}
+		if ee, ok := err.(*exec.ExitError); !ok || ee.ExitCode() == 0 {
+			t.Fatalf("conflicting metrics history must exit non-zero: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		failing.Process.Kill()
+		t.Fatal("server stayed up despite colliding metric records")
+	}
+
+	out := logs.String()
+	if !strings.Contains(out, "sample conflict") || !strings.Contains(out, `"m1"`) || !strings.Contains(out, `"m2"`) {
+		t.Fatalf("error must name the sample conflict and both ids:\n%s", out)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, content) {
+		t.Fatal("failed startup must not modify metrics.log")
+	}
 }
