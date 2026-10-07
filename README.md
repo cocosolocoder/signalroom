@@ -419,6 +419,16 @@ incident. Actions are:
 - `link_event` with `event_id`; the event must already be ingested, must
   belong to the incident's service, and must not already be linked. The same
   event may be linked to several incidents. Linking never modifies the event.
+- `unlink_event` with `event_id`; removes one existing link from this
+  incident. The incident must be `open` and the event id must currently be
+  linked to it. The event store is never consulted, so an id that resolves to
+  no event is treated exactly like any other id that is not currently linked.
+  Unlinking changes only this incident's relationship with the event: the
+  event stays queryable, its links from other incidents are untouched, and
+  the incident's status, participants, and owner do not change. The surviving
+  events keep their relative order; removing the last link leaves `events` as
+  an empty array. A new `link_event` afterwards may re-link the same event,
+  and the re-link is appended at the end of the current list.
 - `resolve` with a non-empty `reason`.
 - `reopen` with a non-empty `reason`.
 - `add_participant` with `participant`: joins a person to the incident.
@@ -429,11 +439,13 @@ incident. Actions are:
 
 Every `participant` value is trimmed of surrounding whitespace, keeps its
 interior case, and must be non-empty afterwards; names differing only in
-case are different people. While `open`, notes, links, resolve, and the
-three personnel actions are accepted. While `resolved`, only reopen is;
-anything else is `409` (including personnel changes). Duplicate joins,
-removing someone who is not a participant, removing the current owner,
-handing ownership to a non-participant or to the current owner, and any new
+case are different people. The same trimming and case rules apply to
+`unlink_event`'s `event_id`. While `open`, notes, links and unlinks,
+resolve, and the three personnel actions are accepted. While `resolved`,
+only reopen is; anything else is `409` (including personnel changes and
+unlinks). Duplicate joins, removing someone who is not a participant,
+removing the current owner, handing ownership to a non-participant or to the
+current owner, unlinking an event that is not currently linked, and any new
 action against a resolved incident are `409` carrying the current version.
 Resolving and reopening never changes the participants or owner. The
 operator of a note or any other action is not added as a participant and is
@@ -458,18 +470,24 @@ successful action with the same normalized content — operator and submitted
 `expected_version` included — returns the first result and adds no history or
 version, even though that expected version is now stale and even if the
 incident has since been handed over, resolved, or the target person removed;
-it never restores an older people state. Concurrent identical submissions
-produce exactly one record. The same `action_id` with different content is
-`409`.
+it never restores an older people state. In the same way, replaying an
+`unlink_event` after the event was re-linked still returns the first result
+and never removes the event a second time, and replaying the original
+`link_event` never puts an unlinked event back. Concurrent identical
+submissions produce exactly one record. The same `action_id` with different
+content is `409`.
 
 Status codes: `400` for a missing field, wrong type, unknown action,
 unknown/extra payload field, a body carrying more than one action payload,
 or a legal new note whose normalized action record saves to more than
 **64 MiB** (`1024*1024` bytes per MiB) in the storage format; `404` when the
-incident (or, for a link, the event) does not exist; `409` for a stale
-version, a state-machine violation, a cross-service or duplicate link, a
-rejected personnel change, or replayed-but-changed content. A rejected
-request never changes the incident.
+incident does not exist, or when a `link_event` targets an event that does
+not exist; `409` for a stale version, a state-machine violation, a
+cross-service or duplicate link, an `unlink_event` against a resolved
+incident or an event that is not currently linked (an id that resolves to no
+event is still just "not linked", never `404`), a rejected personnel change,
+or replayed-but-changed content. A rejected request never changes the
+incident.
 
 #### Note save capacity vs. storage failure
 
@@ -533,7 +551,10 @@ action in commit order. The creation entry records the operator, action
 `create`, the title as its `content`, version `1`, and the server time, and
 has no `action_id`; later entries also carry their `action_id`. Personnel
 actions appear like any other entry, with `content` set to the normalized
-target name. Every `at` is UTC RFC3339Nano. The whole response is one
+target name. An `unlink_event` entry likewise records the removed event id as
+its `content`, and the earlier `link_event` entry for that event is kept, so a
+link, its unlink, and any later re-link all remain visible in order. Every
+`at` is UTC RFC3339Nano. The whole response is one
 committed snapshot, so its people, status, version, and history always
 belong to the same committed state. An unknown id is `404`.
 

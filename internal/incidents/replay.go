@@ -64,6 +64,10 @@ func (r *Registry) checkLoadedAction(state *incidentState, req Request) error {
 		if err := r.loadedLinkError(state, req); err != nil {
 			return err
 		}
+	case ActionUnlinkEvent:
+		if err := loadedUnlinkError(state, req); err != nil {
+			return err
+		}
 	case ActionResolve:
 		if state.status != StatusOpen {
 			return validationErr("resolve action %q on non-open incident in log", req.ActionID)
@@ -101,6 +105,23 @@ func (r *Registry) loadedLinkError(state *incidentState, req Request) error {
 			req.Content, service, state.id, state.service)
 	case linkAlreadyLinked:
 		return validationErr("event %q linked twice in incident %q log", req.Content, state.id)
+	}
+	return nil
+}
+
+// loadedUnlinkError re-runs the shared unlink rules while replaying a
+// durable record. A violation means the log contradicts the rules the live
+// path enforced at commit time, so startup fails without mutating data. The
+// wording stays replay-specific ("in log"); the constraints themselves are
+// checkUnlinkEligibility's, the single place both paths maintain.
+func loadedUnlinkError(state *incidentState, req Request) error {
+	switch checkUnlinkEligibility(state, req) {
+	case unlinkOK:
+		return nil
+	case unlinkClosed:
+		return validationErr("unlink action %q on %s incident in log", req.ActionID, state.status)
+	case unlinkNotLinked:
+		return validationErr("event %q unlinked without being linked in incident %q log", req.Content, state.id)
 	}
 	return nil
 }

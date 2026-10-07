@@ -199,7 +199,7 @@ func actionPayloadField(action string) (string, bool) {
 	switch action {
 	case incidents.ActionNote:
 		return "content", true
-	case incidents.ActionLinkEvent:
+	case incidents.ActionLinkEvent, incidents.ActionUnlinkEvent:
 		return "event_id", true
 	case incidents.ActionResolve, incidents.ActionReopen:
 		return "reason", true
