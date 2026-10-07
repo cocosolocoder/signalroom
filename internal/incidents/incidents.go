@@ -69,6 +69,39 @@ func IsConflictError(err error) bool {
 	return errors.As(err, &target)
 }
 
+// MaxActionPayloadBytes bounds the saved JSON of one newly saved action
+// record: the MarshalRecord output, including the record's own fields and
+// its server timestamp, but excluding the 8-byte storage frame header. It is
+// 64 MiB in 1024*1024-byte units, matching the durable frame capacity. A
+// record encoding to exactly this size is still accepted; only a larger
+// encoding is rejected.
+const MaxActionPayloadBytes = 64 << 20
+
+// OversizeActionError reports that a legal new note's normalized action
+// record encodes to more than MaxActionPayloadBytes in the save format. It
+// is a property of the submitted content, not of storage: the save format
+// JSON-escapes characters such as '&', '<', and '>', so a request well under
+// the 16 MiB body limit can still save far larger. Nothing is written or
+// committed when it is returned, so the incident keeps its prior version,
+// history, people, and links, the rejected action id stays free for a
+// shortened retry, and incident storage remains usable without a restart.
+type OversizeActionError struct {
+	Size  int
+	Limit int
+}
+
+func (e *OversizeActionError) Error() string {
+	return fmt.Sprintf("incident note saves to %d bytes, exceeding the %d byte (64 MiB) save capacity of a single incident record; reduce the amount of content in this submission", e.Size, e.Limit)
+}
+
+// IsOversizeActionError reports whether err is a note whose saved record
+// exceeds the per-record save capacity, as opposed to a validation,
+// conflict, or storage failure.
+func IsOversizeActionError(err error) bool {
+	var target *OversizeActionError
+	return errors.As(err, &target)
+}
+
 // CurrentVersionOf returns the version reported with a version conflict, or
 // zero when err is not a version conflict.
 func CurrentVersionOf(err error) int {
@@ -370,8 +403,25 @@ func (r *Registry) Apply(input Request) (ActionResult, error) {
 	}
 
 	at := r.now()
+	record := NewActionRecord(req, at)
+	// A note's save capacity is measured on the bytes that would actually be
+	// saved in the save format — the complete normalized action record with
+	// its server timestamp, JSON escaping included, excluding the 8-byte
+	// storage frame header — not on the note length, request length, or the
+	// unescaped text. The check follows validation and every state check and
+	// precedes persistence, so an oversize note is refused without touching
+	// durable storage or advancing the incident.
+	if req.Type == ActionNote {
+		payload, err := MarshalRecord(record)
+		if err != nil {
+			return ActionResult{}, err
+		}
+		if len(payload) > MaxActionPayloadBytes {
+			return ActionResult{}, &OversizeActionError{Size: len(payload), Limit: MaxActionPayloadBytes}
+		}
+	}
 	if r.beforeCommit != nil {
-		if err := r.beforeCommit(NewActionRecord(req, at)); err != nil {
+		if err := r.beforeCommit(record); err != nil {
 			return ActionResult{}, err
 		}
 	}

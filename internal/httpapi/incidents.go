@@ -224,6 +224,8 @@ func writeIncidentError(w http.ResponseWriter, err error) {
 	switch {
 	case incidents.IsValidationError(err):
 		writeError(w, http.StatusBadRequest, err.Error())
+	case incidents.IsOversizeActionError(err):
+		writeError(w, http.StatusBadRequest, err.Error())
 	case incidents.IsNotFoundError(err):
 		writeError(w, http.StatusNotFound, err.Error())
 	case incidents.IsConflictError(err):

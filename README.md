@@ -463,11 +463,41 @@ produce exactly one record. The same `action_id` with different content is
 `409`.
 
 Status codes: `400` for a missing field, wrong type, unknown action,
-unknown/extra payload field, or a body carrying more than one action
-payload; `404` when the incident (or, for a link, the event) does not exist;
-`409` for a stale version, a state-machine violation, a cross-service or
-duplicate link, a rejected personnel change, or replayed-but-changed
-content. A rejected request never changes the incident.
+unknown/extra payload field, a body carrying more than one action payload,
+or a legal new note whose normalized action record saves to more than
+**64 MiB** (`1024*1024` bytes per MiB) in the storage format; `404` when the
+incident (or, for a link, the event) does not exist; `409` for a stale
+version, a state-machine violation, a cross-service or duplicate link, a
+rejected personnel change, or replayed-but-changed content. A rejected
+request never changes the incident.
+
+#### Note save capacity vs. storage failure
+
+As with event batches, the request body is capped at 16 MiB, but storage
+measures the bytes actually saved: the save format JSON-escapes content, so
+characters such as `<`, `>`, and `&` take more bytes on disk than in the
+request (an `&` is one request byte but six saved bytes). A legal,
+under-16-MiB `add_note` whose escaped action record — the complete
+normalized record including its own fields and the server timestamp, but
+excluding the 8-byte storage frame header — would exceed 64 MiB is rejected
+with `400` and a non-empty `error` that names the 64 MiB per-record save
+capacity and asks to reduce the content in the submission. The capacity is
+not measured from the note's character count, the request length, or the
+unescaped text; a record encoding to exactly 64 MiB is accepted.
+
+This is a content limit, not a storage fault: nothing is written, the
+incident keeps the same version, history, status, participants, owner, and
+linked events, and incident storage keeps serving queries and later legal
+notes without a restart. The rejected `action_id` remains usable — when the
+incident version has not moved, resubmitting it with the same
+`expected_version` and a shortened note succeeds normally and appends
+exactly one history entry. The capacity judgment affects only a newly saved
+note: unknown incidents, field errors, stale versions, and resolved
+incidents keep their original errors, an identical retry of an already
+committed note keeps returning its first version (even after the incident
+is later resolved), and the same `action_id` with changed content is still
+`409`. A genuine write or sync failure still returns `503` and keeps later
+incident requests failing until restart; only `503` calls for a restart.
 
 ### GET /incidents/{id}
 
