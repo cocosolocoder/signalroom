@@ -24,6 +24,7 @@ const (
 	ActionCreate            = "create"
 	ActionNote              = "add_note"
 	ActionLinkEvent         = "link_event"
+	ActionUnlinkEvent       = "unlink_event"
 	ActionResolve           = "resolve"
 	ActionReopen            = "reopen"
 	ActionAddParticipant    = "add_participant"
@@ -304,7 +305,7 @@ func NormalizeRequest(input Request) (Request, error) {
 		return Request{}, validationErr("expected_version must be a positive integer")
 	}
 	switch input.Type {
-	case ActionNote, ActionLinkEvent, ActionResolve, ActionReopen,
+	case ActionNote, ActionLinkEvent, ActionUnlinkEvent, ActionResolve, ActionReopen,
 		ActionAddParticipant, ActionRemoveParticipant, ActionAssignOwner:
 	default:
 		return Request{}, validationErr("unknown action %q", input.Type)
@@ -319,7 +320,7 @@ func NormalizeRequest(input Request) (Request, error) {
 // payload, used in validation messages.
 func actionContentField(action string) string {
 	switch action {
-	case ActionLinkEvent:
+	case ActionLinkEvent, ActionUnlinkEvent:
 		return "event_id"
 	case ActionResolve, ActionReopen:
 		return "reason"
@@ -446,6 +447,10 @@ func (r *Registry) checkAction(state *incidentState, req Request) error {
 		if err := r.linkConflictError(state, req); err != nil {
 			return err
 		}
+	case ActionUnlinkEvent:
+		if err := unlinkConflictError(state, req); err != nil {
+			return err
+		}
 	case ActionResolve:
 		if state.status != StatusOpen {
 			return conflictErr(state.version, "incident %q is already resolved", state.id)
@@ -526,6 +531,52 @@ func (r *Registry) linkConflictError(state *incidentState, req Request) error {
 	case linkAlreadyLinked:
 		return conflictErr(state.version,
 			"event %q is already linked to incident %q", req.Content, state.id)
+	}
+	return nil
+}
+
+// unlinkViolation identifies one broken unlink_event eligibility rule
+// without binding it to an error vocabulary: the live request path turns it
+// into a 409 in its own wording, while startup replay turns it into a log
+// inconsistency. Keeping the judgment independent of the wording means both
+// entry paths enforce the very same business constraints.
+type unlinkViolation int
+
+const (
+	unlinkOK unlinkViolation = iota
+	// unlinkClosed: an unlink was attempted while the incident was not open.
+	unlinkClosed
+	// unlinkNotLinked: no current link to the event exists on this incident.
+	// Whether the event itself exists is irrelevant — an unlinked id, even
+	// one that was never ingested, is simply not linked.
+	unlinkNotLinked
+)
+
+// checkUnlinkEligibility evaluates the unlink rules shared by the live
+// request path and startup replay: an event may be unlinked only while the
+// incident is open and only when this incident currently links it.
+func checkUnlinkEligibility(state *incidentState, req Request) unlinkViolation {
+	if state.status != StatusOpen {
+		return unlinkClosed
+	}
+	if _, linked := state.linkSet[req.Content]; !linked {
+		return unlinkNotLinked
+	}
+	return unlinkOK
+}
+
+// unlinkConflictError renders a shared unlink violation in the live request
+// path's vocabulary: every violation is a 409-style conflict carrying the
+// current version.
+func unlinkConflictError(state *incidentState, req Request) error {
+	switch checkUnlinkEligibility(state, req) {
+	case unlinkOK:
+		return nil
+	case unlinkClosed:
+		return conflictErr(state.version, "cannot unlink an event from a %s incident", state.status)
+	case unlinkNotLinked:
+		return conflictErr(state.version,
+			"event %q is not linked to incident %q", req.Content, state.id)
 	}
 	return nil
 }
@@ -660,6 +711,9 @@ func (s *incidentState) commit(req Request, at time.Time) int {
 	case ActionLinkEvent:
 		s.linkSet[req.Content] = struct{}{}
 		s.links = append(s.links, req.Content)
+	case ActionUnlinkEvent:
+		delete(s.linkSet, req.Content)
+		s.links = removeString(s.links, req.Content)
 	case ActionResolve:
 		s.status = StatusResolved
 	case ActionReopen:

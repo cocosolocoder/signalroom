@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -484,4 +485,327 @@ func TestHTTPConcurrentDuplicateActionCommitsOnce(t *testing.T) {
 	if len(store.records) != 2 {
 		t.Fatalf("duplicate concurrent actions must persist once, got %d records", len(store.records))
 	}
+}
+
+func TestHTTPUnlinkEventFlow(t *testing.T) {
+	server, store, tl, _ := newIncidentServer(t)
+	ingestEvent(t, tl, "e1", "gateway")
+	ingestEvent(t, tl, "e2", "gateway")
+	ingestEvent(t, tl, "e3", "gateway")
+	createIncident(t, server)
+
+	// Link all three events.
+	for i, id := range []string{"e1", "e2", "e3"} {
+		body := fmtAction(id, i+1, "l"+id, "link_event", "event_id")
+		status, res := postAction(t, server, "INC-1", body)
+		if status != http.StatusOK || number(res["version"]) != i+2 {
+			t.Fatalf("link %s %d %v", id, status, res)
+		}
+	}
+
+	// Unlink the middle event; whitespace around the id is trimmed.
+	status, res := postAction(t, server, "INC-1",
+		`{"action_id":"u2","operator":"carol","expected_version":4,"action":"unlink_event","event_id":"  e2  "}`)
+	if status != http.StatusOK || number(res["version"]) != 5 {
+		t.Fatalf("unlink e2 %d %v", status, res)
+	}
+	if res["incident_id"] != "INC-1" || res["action_id"] != "u2" {
+		t.Fatalf("unlink response %v", res)
+	}
+
+	status, got := doJSON(t, server, http.MethodGet, "/incidents/INC-1", "")
+	if status != http.StatusOK {
+		t.Fatalf("get %d", status)
+	}
+	linked, _ := got["events"].([]any)
+	if len(linked) != 2 ||
+		linked[0].(map[string]any)["id"] != "e1" ||
+		linked[1].(map[string]any)["id"] != "e3" {
+		t.Fatalf("remaining links must keep order: %v", got["events"])
+	}
+	history, _ := got["history"].([]any)
+	if len(history) != 5 {
+		t.Fatalf("history len %d", len(history))
+	}
+	unlinkEntry := history[4].(map[string]any)
+	if unlinkEntry["action"] != "unlink_event" || unlinkEntry["content"] != "e2" ||
+		unlinkEntry["operator"] != "carol" || number(unlinkEntry["version"]) != 5 {
+		t.Fatalf("unlink history entry %v", unlinkEntry)
+	}
+	// The original link entry remains with its own version.
+	oldLink := history[2].(map[string]any)
+	if oldLink["action"] != "link_event" || oldLink["content"] != "e2" {
+		t.Fatalf("original link entry must remain: %v", oldLink)
+	}
+
+	// Remove the final remaining events one by one; the last removal yields
+	// an empty events array.
+	status, _ = postAction(t, server, "INC-1",
+		`{"action_id":"u1","operator":"carol","expected_version":5,"action":"unlink_event","event_id":"e1"}`)
+	if status != http.StatusOK {
+		t.Fatalf("unlink e1 status %d", status)
+	}
+	status, _ = postAction(t, server, "INC-1",
+		`{"action_id":"u3","operator":"carol","expected_version":6,"action":"unlink_event","event_id":"e3"}`)
+	if status != http.StatusOK {
+		t.Fatalf("unlink e3 status %d", status)
+	}
+	status, got = doJSON(t, server, http.MethodGet, "/incidents/INC-1", "")
+	if status != http.StatusOK {
+		t.Fatalf("get %d", status)
+	}
+	if events, ok := got["events"].([]any); !ok || len(events) != 0 {
+		t.Fatalf("events must be an empty array: %v", got["events"])
+	}
+	if number(got["version"]) != 7 {
+		t.Fatalf("version %v", got["version"])
+	}
+	// One durable record per accepted action: create, 3 links, 3 unlinks.
+	if len(store.records) != 7 {
+		t.Fatalf("durable records %d", len(store.records))
+	}
+}
+
+func TestHTTPUnlinkValidation(t *testing.T) {
+	server, _, tl, _ := newIncidentServer(t)
+	ingestEvent(t, tl, "e1", "gateway")
+	createIncident(t, server)
+	_, _ = postAction(t, server, "INC-1",
+		`{"action_id":"l1","operator":"b","expected_version":1,"action":"link_event","event_id":"e1"}`)
+
+	bad := map[string]string{
+		"missing event id":    `{"action_id":"u0","operator":"b","expected_version":2,"action":"unlink_event"}`,
+		"null event id":       `{"action_id":"u0","operator":"b","expected_version":2,"action":"unlink_event","event_id":null}`,
+		"blank event id":      `{"action_id":"u0","operator":"b","expected_version":2,"action":"unlink_event","event_id":"  "}`,
+		"wrong payload field": `{"action_id":"u0","operator":"b","expected_version":2,"action":"unlink_event","content":"e1"}`,
+		"extra payload field": `{"action_id":"u0","operator":"b","expected_version":2,"action":"unlink_event","event_id":"e1","reason":"x"}`,
+		"unknown field":       `{"action_id":"u0","operator":"b","expected_version":2,"action":"unlink_event","event_id":"e1","bogus":1}`,
+	}
+	for name, body := range bad {
+		status, out := postAction(t, server, "INC-1", body)
+		if status != http.StatusBadRequest || out["error"] == "" {
+			t.Fatalf("%s: want 400 with error, got %d %v", name, status, out)
+		}
+	}
+}
+
+func TestHTTPUnlinkConflicts(t *testing.T) {
+	server, _, tl, _ := newIncidentServer(t)
+	ingestEvent(t, tl, "e1", "gateway")
+	ingestEvent(t, tl, "e2", "gateway")
+	createIncident(t, server)
+	_, _ = postAction(t, server, "INC-1",
+		`{"action_id":"l1","operator":"b","expected_version":1,"action":"link_event","event_id":"e1"}`)
+
+	// Not linked: an existing-but-unlinked event and an id that was never
+	// ingested are both plain 409s carrying the current version.
+	for _, target := range []string{"e2", "never-ingested"} {
+		status, out := postAction(t, server, "INC-1",
+			`{"action_id":"u-x","operator":"b","expected_version":2,"action":"unlink_event","event_id":"`+target+`"}`)
+		if status != http.StatusConflict {
+			t.Fatalf("unlink %s: want 409, got %d", target, status)
+		}
+		if number(out["current_version"]) != 2 || out["error"] == "" {
+			t.Fatalf("unlink %s response %v", target, out)
+		}
+	}
+
+	// Stale version conflict also carries the current version.
+	status, out := postAction(t, server, "INC-1",
+		`{"action_id":"u-s","operator":"b","expected_version":1,"action":"unlink_event","event_id":"e1"}`)
+	if status != http.StatusConflict || number(out["current_version"]) != 2 {
+		t.Fatalf("stale unlink %d %v", status, out)
+	}
+
+	// Resolve; unlink is refused there too, even for a currently linked event.
+	if status, _ := postAction(t, server, "INC-1",
+		`{"action_id":"r1","operator":"b","expected_version":2,"action":"resolve","reason":"done"}`); status != http.StatusOK {
+		t.Fatalf("resolve status %d", status)
+	}
+	status, out = postAction(t, server, "INC-1",
+		`{"action_id":"u-r","operator":"b","expected_version":3,"action":"unlink_event","event_id":"e1"}`)
+	if status != http.StatusConflict || number(out["current_version"]) != 3 {
+		t.Fatalf("resolved unlink %d %v", status, out)
+	}
+
+	// Every refusal leaves the link list and history alone.
+	status, got := doJSON(t, server, http.MethodGet, "/incidents/INC-1", "")
+	if status != http.StatusOK {
+		t.Fatalf("get %d", status)
+	}
+	linked, _ := got["events"].([]any)
+	if len(linked) != 1 || linked[0].(map[string]any)["id"] != "e1" {
+		t.Fatalf("refused unlinks must keep the link: %v", got["events"])
+	}
+	history, _ := got["history"].([]any)
+	if len(history) != 3 { // create, link, resolve
+		t.Fatalf("refused unlinks must not add history: %d", len(history))
+	}
+}
+
+func TestHTTPUnlinkMissingIncident(t *testing.T) {
+	server, _, _, _ := newIncidentServer(t)
+	status, body := postAction(t, server, "ghost",
+		`{"action_id":"u1","operator":"b","expected_version":1,"action":"unlink_event","event_id":"e1"}`)
+	if status != http.StatusNotFound || body["error"] == "" {
+		t.Fatalf("missing incident %d %v", status, body)
+	}
+}
+
+// TestHTTPUnlinkReplayAndRelink covers link -> unlink -> relink retries
+// end to end: identical replays return first results without advancing, the
+// stale link replay cannot restore the removed event, the stale unlink
+// replay cannot remove a re-linked event, and the fresh relink lands last.
+func TestHTTPUnlinkReplayAndRelink(t *testing.T) {
+	server, _, tl, _ := newIncidentServer(t)
+	ingestEvent(t, tl, "e1", "gateway")
+	ingestEvent(t, tl, "e9", "gateway")
+	createIncident(t, server)
+
+	linkBody := `{"action_id":"l1","operator":"bob","expected_version":1,"action":"link_event","event_id":"e1"}`
+	unlinkBody := `{"action_id":"u1","operator":"bob","expected_version":2,"action":"unlink_event","event_id":"e1"}`
+	if status, body := postAction(t, server, "INC-1", linkBody); status != http.StatusOK || number(body["version"]) != 2 {
+		t.Fatalf("link %d %v", status, body)
+	}
+	if status, body := postAction(t, server, "INC-1", unlinkBody); status != http.StatusOK || number(body["version"]) != 3 {
+		t.Fatalf("unlink %d %v", status, body)
+	}
+
+	// Both replays return their original results and change nothing.
+	if status, body := postAction(t, server, "INC-1", linkBody); status != http.StatusOK || number(body["version"]) != 2 {
+		t.Fatalf("link replay %d %v", status, body)
+	}
+	if status, body := postAction(t, server, "INC-1", unlinkBody); status != http.StatusOK || number(body["version"]) != 3 {
+		t.Fatalf("unlink replay %d %v", status, body)
+	}
+	status, got := doJSON(t, server, http.MethodGet, "/incidents/INC-1", "")
+	if status != http.StatusOK {
+		t.Fatalf("get status %d", status)
+	}
+	if number(got["version"]) != 3 {
+		t.Fatalf("replays must not advance: %v", got["version"])
+	}
+	if events, _ := got["events"].([]any); len(events) != 0 {
+		t.Fatalf("link replay must not re-add the event: %v", got["events"])
+	}
+
+	// Fresh link of e9, then relink e1; e1 must appear last.
+	if status, _ := postAction(t, server, "INC-1",
+		`{"action_id":"l9","operator":"bob","expected_version":3,"action":"link_event","event_id":"e9"}`); status != http.StatusOK {
+		t.Fatalf("link e9 status %d", status)
+	}
+	if status, _ := postAction(t, server, "INC-1",
+		`{"action_id":"l2","operator":"bob","expected_version":4,"action":"link_event","event_id":"e1"}`); status != http.StatusOK {
+		t.Fatalf("relink e1 status %d", status)
+	}
+	status, got = doJSON(t, server, http.MethodGet, "/incidents/INC-1", "")
+	linked, _ := got["events"].([]any)
+	if len(linked) != 2 || linked[0].(map[string]any)["id"] != "e9" || linked[1].(map[string]any)["id"] != "e1" {
+		t.Fatalf("relinked event must be last: %v", got["events"])
+	}
+
+	// The old unlink replay still reports version 3 and must not remove the
+	// relink.
+	if status, body := postAction(t, server, "INC-1", unlinkBody); status != http.StatusOK || number(body["version"]) != 3 {
+		t.Fatalf("unlink replay after relink %d %v", status, body)
+	}
+	status, got = doJSON(t, server, http.MethodGet, "/incidents/INC-1", "")
+	linked, _ = got["events"].([]any)
+	if number(got["version"]) != 5 || len(linked) != 2 || linked[1].(map[string]any)["id"] != "e1" {
+		t.Fatalf("stale unlink replay must not remove the relink: %v", got)
+	}
+
+	// Same action id with different content is a conflict for both actions.
+	if status, _ := postAction(t, server, "INC-1",
+		`{"action_id":"u1","operator":"bob","expected_version":5,"action":"unlink_event","event_id":"e9"}`); status != http.StatusConflict {
+		t.Fatalf("changed unlink content status %d", status)
+	}
+	if status, _ := postAction(t, server, "INC-1",
+		`{"action_id":"l1","operator":"bob","expected_version":5,"action":"link_event","event_id":"e9"}`); status != http.StatusConflict {
+		t.Fatalf("changed link content status %d", status)
+	}
+
+	// History documents link, unlink, link e9, relink e1 in that order.
+	history, _ := got["history"].([]any)
+	want := []struct{ action, content string }{
+		{"create", "Outage"},
+		{"link_event", "e1"},
+		{"unlink_event", "e1"},
+		{"link_event", "e9"},
+		{"link_event", "e1"},
+	}
+	if len(history) != len(want) {
+		t.Fatalf("history len %d", len(history))
+	}
+	for i, w := range want {
+		entry := history[i].(map[string]any)
+		if entry["action"] != w.action || entry["content"] != w.content {
+			t.Fatalf("history[%d]=%v want %+v", i, entry, w)
+		}
+	}
+}
+
+// TestHTTPUnlinkIsolatesRelationship verifies the unlink touches only this
+// incident/event pair: the event stays in the timeline and stays linked to a
+// second incident, while status, participants, and owner are unchanged.
+func TestHTTPUnlinkIsolatesRelationship(t *testing.T) {
+	server, _, tl, _ := newIncidentServer(t)
+	ingestEvent(t, tl, "e1", "gateway")
+	createIncident(t, server)
+	if status, body := doJSON(t, server, http.MethodPost, "/incidents",
+		`{"id":"INC-2","title":"Second","service":"gateway","operator":"alice"}`); status != http.StatusOK {
+		t.Fatalf("create INC-2 %d %v", status, body)
+	}
+	if status, _ := postAction(t, server, "INC-1",
+		`{"action_id":"l1","operator":"bob","expected_version":1,"action":"link_event","event_id":"e1"}`); status != http.StatusOK {
+		t.Fatalf("link to INC-1 status %d", status)
+	}
+	if status, _ := postAction(t, server, "INC-2",
+		`{"action_id":"l1","operator":"bob","expected_version":1,"action":"link_event","event_id":"e1"}`); status != http.StatusOK {
+		t.Fatalf("link to INC-2 status %d", status)
+	}
+
+	if status, _ := postAction(t, server, "INC-1",
+		`{"action_id":"u1","operator":"bob","expected_version":2,"action":"unlink_event","event_id":"e1"}`); status != http.StatusOK {
+		t.Fatalf("unlink status %d", status)
+	}
+
+	// INC-1: link gone, everything else untouched.
+	_, got1 := doJSON(t, server, http.MethodGet, "/incidents/INC-1", "")
+	if events, _ := got1["events"].([]any); len(events) != 0 {
+		t.Fatalf("INC-1 events %v", got1["events"])
+	}
+	if got1["status"] != "open" || got1["owner"] != "alice" {
+		t.Fatalf("INC-1 status/owner moved: %v", got1)
+	}
+	if people, _ := got1["participants"].([]any); len(people) != 1 || people[0] != "alice" {
+		t.Fatalf("INC-1 participants moved: %v", got1["participants"])
+	}
+
+	// INC-2 still links the event.
+	_, got2 := doJSON(t, server, http.MethodGet, "/incidents/INC-2", "")
+	if events, _ := got2["events"].([]any); len(events) != 1 || events[0].(map[string]any)["id"] != "e1" {
+		t.Fatalf("INC-2 must keep the link: %v", got2["events"])
+	}
+
+	// The raw event is still queryable with its original content.
+	resp, err := http.Get(server.URL + "/events")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	var eventsList []map[string]any
+	if err := json.Unmarshal(raw, &eventsList); err != nil {
+		t.Fatal(err)
+	}
+	if len(eventsList) != 1 || eventsList[0]["id"] != "e1" || eventsList[0]["service"] != "gateway" {
+		t.Fatalf("event timeline changed: %v", eventsList)
+	}
+}
+
+// fmtAction builds an action body with one named payload member.
+func fmtAction(eventID string, expectedVersion int, actionID, action, payloadField string) string {
+	return `{"action_id":"` + actionID + `","operator":"bob","expected_version":` +
+		strconv.Itoa(expectedVersion) + `,"action":"` + action + `","` + payloadField + `":"` + eventID + `"}`
 }

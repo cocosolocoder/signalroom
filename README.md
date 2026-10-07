@@ -419,6 +419,16 @@ incident. Actions are:
 - `link_event` with `event_id`; the event must already be ingested, must
   belong to the incident's service, and must not already be linked. The same
   event may be linked to several incidents. Linking never modifies the event.
+- `unlink_event` with `event_id`; removes one existing link from this
+  incident. The target must currently be linked to this incident — an event
+  that is not linked, including an id that was never ingested, is a `409`
+  carrying the current version rather than a `404`. Unlinking never modifies
+  or deletes the event: it stays queryable and stays linked to every other
+  incident, and the incident's status, participants, and owner are unchanged.
+  The remaining linked events keep their relative order; removing the last
+  one yields an empty `events` list. The event can be linked again
+  afterwards with a fresh `link_event`, and it then appears at the end of the
+  list, so history can show link, unlink, and relink in order.
 - `resolve` with a non-empty `reason`.
 - `reopen` with a non-empty `reason`.
 - `add_participant` with `participant`: joins a person to the incident.
@@ -429,12 +439,13 @@ incident. Actions are:
 
 Every `participant` value is trimmed of surrounding whitespace, keeps its
 interior case, and must be non-empty afterwards; names differing only in
-case are different people. While `open`, notes, links, resolve, and the
-three personnel actions are accepted. While `resolved`, only reopen is;
-anything else is `409` (including personnel changes). Duplicate joins,
-removing someone who is not a participant, removing the current owner,
-handing ownership to a non-participant or to the current owner, and any new
-action against a resolved incident are `409` carrying the current version.
+case are different people. While `open`, notes, links, unlinks, resolve, and
+the three personnel actions are accepted. While `resolved`, only reopen is;
+anything else is `409` (including personnel changes and event unlinks).
+Duplicate joins, removing someone who is not a participant, removing the
+current owner, handing ownership to a non-participant or to the current
+owner, unlinking an event that is not currently linked, and any new action
+against a resolved incident are `409` carrying the current version.
 Resolving and reopening never changes the participants or owner. The
 operator of a note or any other action is not added as a participant and is
 not rejected for being outside the participant list.
@@ -458,18 +469,21 @@ successful action with the same normalized content — operator and submitted
 `expected_version` included — returns the first result and adds no history or
 version, even though that expected version is now stale and even if the
 incident has since been handed over, resolved, or the target person removed;
-it never restores an older people state. Concurrent identical submissions
-produce exactly one record. The same `action_id` with different content is
-`409`.
+it never restores an older people state or an older link state: replaying an
+old `link_event` never puts an event that was later unlinked back into the
+detail, and replaying an old `unlink_event` never removes an event that was
+linked again. Concurrent identical submissions produce exactly one record.
+The same `action_id` with different content is `409`.
 
 Status codes: `400` for a missing field, wrong type, unknown action,
 unknown/extra payload field, a body carrying more than one action payload,
 or a legal new note whose normalized action record saves to more than
 **64 MiB** (`1024*1024` bytes per MiB) in the storage format; `404` when the
 incident (or, for a link, the event) does not exist; `409` for a stale
-version, a state-machine violation, a cross-service or duplicate link, a
-rejected personnel change, or replayed-but-changed content. A rejected
-request never changes the incident.
+version, a state-machine violation, a cross-service or duplicate link, an
+unlink of an event not currently linked, a rejected personnel change, or
+replayed-but-changed content. A rejected request never changes the
+incident.
 
 #### Note save capacity vs. storage failure
 
@@ -509,15 +523,16 @@ Return one incident:
   "title": "Checkout outage",
   "service": "checkout",
   "status": "resolved",
-  "version": 4,
+  "version": 5,
   "participants": ["alice", "bob"],
   "owner": "bob",
-  "events": [ { "id": "evt-1", "...": "full stored event content" } ],
+  "events": [],
   "history": [
     {"operator":"alice","action":"create","content":"Checkout outage","version":1,"at":"2026-10-02T08:00:00.123456789Z"},
     {"action_id":"n1","operator":"bob","action":"add_note","content":"investigating","version":2,"at":"..."},
     {"action_id":"l1","operator":"bob","action":"link_event","content":"evt-1","version":3,"at":"..."},
-    {"action_id":"r1","operator":"bob","action":"resolve","content":"rolled back","version":4,"at":"..."}
+    {"action_id":"u1","operator":"bob","action":"unlink_event","content":"evt-1","version":4,"at":"..."},
+    {"action_id":"r1","operator":"bob","action":"resolve","content":"rolled back","version":5,"at":"..."}
   ]
 }
 ```
