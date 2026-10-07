@@ -370,8 +370,26 @@ func (r *Registry) Apply(input Request) (ActionResult, error) {
 	}
 
 	at := r.now()
+	record := NewActionRecord(req, at)
+	// Only a brand-new legal note is measured against the per-record save
+	// capacity; replays were handled above and every other rejection order is
+	// unchanged. Measure the exact bytes the record would save, including the
+	// JSON escaping the save format applies (so a note full of '&', '<', or
+	// '>' is counted by its escaped length) and the server timestamp, but
+	// excluding the storage frame header. The check precedes persistence, so
+	// an oversize note neither touches durable storage nor advances the
+	// incident; the log stays usable without a restart.
+	if req.Type == ActionNote {
+		payload, err := MarshalRecord(record)
+		if err != nil {
+			return ActionResult{}, err
+		}
+		if len(payload) > MaxRecordPayloadBytes {
+			return ActionResult{}, &OversizeRecordError{Size: len(payload), Limit: MaxRecordPayloadBytes}
+		}
+	}
 	if r.beforeCommit != nil {
-		if err := r.beforeCommit(NewActionRecord(req, at)); err != nil {
+		if err := r.beforeCommit(record); err != nil {
 			return ActionResult{}, err
 		}
 	}

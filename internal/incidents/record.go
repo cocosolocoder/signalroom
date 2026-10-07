@@ -16,6 +16,38 @@ const (
 	RecordAction   = "action"
 )
 
+// MaxRecordPayloadBytes bounds what one newly saved incident record may hold
+// in the on-disk save format (MarshalRecord): 64 MiB in 1024*1024-byte units,
+// matching the durable frame capacity. It measures the complete encoded JSON
+// of the normalized record that would actually be written, including the
+// record's own fields and the server timestamp, but not the surrounding
+// 8-byte storage frame header. A record encoding to exactly this size is
+// still accepted; only a larger encoding is rejected.
+const MaxRecordPayloadBytes = 64 << 20
+
+// OversizeRecordError reports that a brand-new add_note record encodes to
+// more than MaxRecordPayloadBytes in the save format. It is a property of
+// the note content, not of the storage: nothing is written, the incident log
+// stays usable without a restart, the incident is left exactly as it was,
+// and the rejected action id remains free for a shorter follow-up request.
+// Replays of already-stored actions are never measured.
+type OversizeRecordError struct {
+	Size  int
+	Limit int
+}
+
+func (e *OversizeRecordError) Error() string {
+	return fmt.Sprintf("incident record saves to %d bytes, exceeding the 64 MiB (%d bytes) save capacity of a single incident record; reduce the content of this submission", e.Size, e.Limit)
+}
+
+// IsOversizeRecordError reports whether err is a new record that exceeds the
+// save capacity, as opposed to a validation, conflict, not-found, or storage
+// failure.
+func IsOversizeRecordError(err error) bool {
+	var target *OversizeRecordError
+	return errors.As(err, &target)
+}
+
 // StoredAction is one committed action with its server timestamp.
 type StoredAction struct {
 	Request Request

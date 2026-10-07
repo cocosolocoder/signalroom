@@ -463,11 +463,41 @@ produce exactly one record. The same `action_id` with different content is
 `409`.
 
 Status codes: `400` for a missing field, wrong type, unknown action,
-unknown/extra payload field, or a body carrying more than one action
-payload; `404` when the incident (or, for a link, the event) does not exist;
+unknown/extra payload field, a body carrying more than one action
+payload, or a new note whose saved record exceeds the 64 MiB save
+capacity; `404` when the incident (or, for a link, the event) does not exist;
 `409` for a stale version, a state-machine violation, a cross-service or
 duplicate link, a rejected personnel change, or replayed-but-changed
 content. A rejected request never changes the incident.
+
+#### Note save capacity vs. storage failure
+
+The request body is capped at 16 MiB, but storage measures the bytes the
+single new incident record actually saves in the record JSON format, which
+HTML-escapes the note: characters such as `<`, `>`, and `&` take more saved
+bytes than request bytes (an `&` is one request byte but six saved bytes).
+A legal, under-16-MiB body whose new action record would save to more than
+**64 MiB** (`1024*1024` bytes per MiB) is rejected with `400` and a
+non-empty `error` that names the 64 MiB per-incident-record save capacity
+and asks for less content in the submission. The capacity is the byte
+length of the whole normalized record that would be written — the record's
+own fields and the server timestamp included, the 8-byte storage frame
+header excluded — not the note's character count, the request length, or
+the unescaped text; a record encoding to exactly 64 MiB is accepted.
+
+This is a content limit, not a storage fault: nothing is written, no note
+history, version, status, participants, owner, or linked event changes, the
+incident log keeps serving requests without a restart, and the rejected
+`action_id` stays free — when the incident has not otherwise moved,
+resubmitting it with the same `expected_version` and a shorter note gives
+the ordinary success and adds exactly one history entry. Only a brand-new
+saved note is measured; an identical retry of an already-committed note
+replays its first result regardless of size, even after the incident has
+since been resolved. The capacity check runs after the usual validation,
+not-found, version, and state checks, so unknown incidents, malformed
+fields, stale versions, and resolved incidents keep their existing `400`,
+`404`, and `409` responses. By contrast, a genuine write or sync failure
+still returns `503`, after which incident requests fail until restart.
 
 ### GET /incidents/{id}
 
