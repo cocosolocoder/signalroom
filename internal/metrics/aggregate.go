@@ -63,11 +63,26 @@ var (
 	ErrDeltaNotFinite = errors.New("aggregate delta total is not a finite number")
 )
 
+// seriesSnapshot is one matching series' committed state, detached from the
+// store so the segment computation can run without holding the read lock.
+// Labels is shared with the store (series label sets never change once
+// created); points is a private copy.
+type seriesSnapshot struct {
+	service string
+	labels  map[string]string
+	points  []point
+}
+
 // Aggregate computes per-series sample counts and cumulative deltas over the
-// query window using a single read of the store, so every series and segment
-// reflects one committed snapshot. Late arrivals are bucketed by their own
-// sample time, so an unchanged dataset always yields the same result
-// regardless of ingestion order.
+// query window from one committed snapshot of the store, so every series and
+// segment reflects the same committed dataset. The read lock is held only
+// while the matching series are selected and their relevant points copied;
+// the segment computation then runs on those private copies, so batches
+// submitted while a query is still computing can commit without waiting for
+// it. Such batches never leak into the in-flight result — it keeps reflecting
+// the snapshot it selected — and are visible in full to later queries. Late
+// arrivals are bucketed by their own sample time, so an unchanged dataset
+// always yields the same result regardless of ingestion order.
 func (s *Store) Aggregate(query AggregateQuery) ([]AggregateSeries, error) {
 	segments, err := ValidateAggregateQuery(query)
 	if err != nil {
@@ -77,11 +92,41 @@ func (s *Store) Aggregate(query AggregateQuery) ([]AggregateSeries, error) {
 	name := strings.TrimSpace(query.Name)
 	service := strings.TrimSpace(query.Service)
 
+	snapshots, err := s.snapshotSeries(query, name, service, len(segments))
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]AggregateSeries, 0, len(snapshots))
+	var grandTotal float64
+	for _, snap := range snapshots {
+		seriesSegs := append([]AggregateSegment(nil), segments...)
+		total, err := fillSeries(seriesSegs, snap.points, query)
+		if err != nil {
+			return nil, err
+		}
+		grandTotal += total
+		if !isFinite(grandTotal) {
+			return nil, ErrDeltaNotFinite
+		}
+		out = append(out, AggregateSeries{
+			Service:  snap.service,
+			Labels:   snap.labels,
+			Segments: seriesSegs,
+		})
+	}
+	return out, nil
+}
+
+// snapshotSeries selects the matching series that actually have a sample in
+// the half-open window, in a stable order (service, then full label set), and
+// copies the points the segment computation needs. It runs entirely under
+// the read lock, so the copies together are one committed snapshot; once it
+// returns, ingestion may proceed while the caller computes.
+func (s *Store) snapshotSeries(query AggregateQuery, name, service string, segmentCount int) ([]seriesSnapshot, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	// Select the matching series that actually have a sample in the
-	// half-open window, in a stable order (service, then full label set).
 	keys := make([]seriesKey, 0, len(s.series))
 	for key, state := range s.series {
 		if key.name != name {
@@ -105,30 +150,20 @@ func (s *Store) Aggregate(query AggregateQuery) ([]AggregateSeries, error) {
 		return keys[i].labels < keys[j].labels
 	})
 
-	if len(keys)*len(segments) > MaxAggregateSeriesSegments {
+	if len(keys)*segmentCount > MaxAggregateSeriesSegments {
 		return nil, ErrTooManySeriesSegments
 	}
 
-	out := make([]AggregateSeries, 0, len(keys))
-	var grandTotal float64
+	snapshots := make([]seriesSnapshot, 0, len(keys))
 	for _, key := range keys {
 		state := s.series[key]
-		seriesSegs := append([]AggregateSegment(nil), segments...)
-		total, err := fillSeries(seriesSegs, state.points, query)
-		if err != nil {
-			return nil, err
-		}
-		grandTotal += total
-		if !isFinite(grandTotal) {
-			return nil, ErrDeltaNotFinite
-		}
-		out = append(out, AggregateSeries{
-			Service:  key.service,
-			Labels:   state.labels,
-			Segments: seriesSegs,
+		snapshots = append(snapshots, seriesSnapshot{
+			service: key.service,
+			labels:  state.labels,
+			points:  state.windowPoints(query.Since, query.Until),
 		})
 	}
-	return out, nil
+	return snapshots, nil
 }
 
 // labelsMatch reports whether a series' full label set satisfies every
@@ -183,10 +218,32 @@ func (st *seriesState) hasPointBetween(since, until time.Time) bool {
 	return idx < len(st.points) && st.points[idx].at.Before(until)
 }
 
+// windowPoints copies the points an aggregate over [since, until) needs: the
+// nearest point strictly before since (the first in-window sample's
+// predecessor) and every point before until. The copy detaches the result
+// from the store — later insertions may rewrite the shared backing array in
+// place — so the segment computation can run after the read lock is released.
+func (st *seriesState) windowPoints(since, until time.Time) []point {
+	first := sort.Search(len(st.points), func(i int) bool {
+		return !st.points[i].at.Before(since)
+	})
+	end := sort.Search(len(st.points), func(i int) bool {
+		return !st.points[i].at.Before(until)
+	})
+	start := first
+	if first > 0 {
+		start = first - 1
+	}
+	out := make([]point, end-start)
+	copy(out, st.points[start:end])
+	return out
+}
+
 // fillSeries counts samples per segment and attributes cumulative deltas.
-// The nearest sample strictly before the window start acts as the first
-// in-window sample's predecessor; a sample with no predecessor anywhere
-// contributes no delta. A value that does not move backwards contributes the
+// points is a detached copy (windowPoints) holding the nearest sample
+// strictly before the window start — the first in-window sample's
+// predecessor — followed by every sample before the window end; a sample
+// with no predecessor anywhere contributes no delta. A value that does not move backwards contributes the
 // difference; a backwards move is a counter reset and contributes the current
 // value. Every delta lands in the segment containing the later sample; the
 // sample at the window end never participates. It returns the series' total

@@ -456,3 +456,139 @@ func TestAggregateUnchangedAfterConflictBatch(t *testing.T) {
 	}
 	assertScenarioResult(t, committed, []string{"1", "2", "3"}, afterCounts, afterDeltas)
 }
+
+// ensureSlowComputation grows the store with in-window filler series until
+// one aggregate call over the scenario window takes long enough that its
+// segment computation overlaps deterministically with a concurrent
+// submission. Unlike ensureSlowAggregate, the filler points fall inside the
+// query window (one dense cluster per series), so they inflate the per-series
+// delta computation, not just the selection scan.
+func ensureSlowComputation(t *testing.T, s *Store, query AggregateQuery) time.Duration {
+	t.Helper()
+	t0 := aggScenarioAnchor()
+	scan := func() time.Duration {
+		start := time.Now()
+		if _, err := s.Aggregate(query); err != nil {
+			t.Fatalf("warmup aggregate: %v", err)
+		}
+		return time.Since(start)
+	}
+	series := 0
+	for round := 0; round < 8; round++ {
+		const (
+			chunkSeries = 30
+			pointsEach  = 4000
+		)
+		fillers := make([]Sample, 0, chunkSeries*pointsEach)
+		for k := 0; k < chunkSeries; k++ {
+			id := strconv.Itoa(series + k)
+			for i := 0; i < pointsEach; i++ {
+				fillers = append(fillers, Sample{
+					ID:      "slow-" + id + "-" + strconv.Itoa(i),
+					Service: "svc",
+					Name:    "requests",
+					At:      t0.Add(time.Duration(i) * 30 * time.Microsecond),
+					Value:   float64(i),
+					Labels:  map[string]string{"slow": id},
+				})
+			}
+		}
+		if _, err := s.Ingest(fillers, noopCommit); err != nil {
+			t.Fatalf("seed computation fillers: %v", err)
+		}
+		series += chunkSeries
+		var slowest time.Duration
+		for range 3 {
+			if d := scan(); d > slowest {
+				slowest = d
+			}
+		}
+		if slowest >= 20*time.Millisecond {
+			return slowest
+		}
+	}
+	return scan()
+}
+
+// TestAggregateComputationDoesNotBlockIngest pins the decoupling of snapshot
+// selection from segment computation: once an aggregate has selected its
+// committed data, a new valid batch must be able to commit while the
+// in-flight query is still computing. The aggregate goroutine runs over a
+// store whose in-window dataset makes the computation measurably slow; the
+// submission's commit hook must be reached before that aggregate returns —
+// with the computation holding the read lock (the old shape), the hook could
+// only run after the aggregate finished. The in-flight result must still be
+// exactly one committed dataset (fully pre- or fully post-batch), and a query
+// issued after the commit must show the batch's complete effect.
+func TestAggregateComputationDoesNotBlockIngest(t *testing.T) {
+	s := NewStore()
+	query := aggScenarioQuery()
+	if _, err := s.Ingest(scenarioSeedSamples(), nil); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	computeTime := ensureSlowComputation(t, s, query)
+
+	before, err := s.Aggregate(query)
+	if err != nil {
+		t.Fatalf("aggregate before: %v", err)
+	}
+
+	aggDone := make(chan []AggregateSeries, 1)
+	go func() {
+		got, err := s.Aggregate(query)
+		if err != nil {
+			t.Errorf("overlapping aggregate: %v", err)
+			return
+		}
+		aggDone <- got
+	}()
+	// Let the aggregate get well into its work; the assertions below hold for
+	// either scheduling outcome.
+	time.Sleep(computeTime / 2)
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	ingestDone := make(chan struct{})
+	go func() {
+		defer close(ingestDone)
+		result, err := s.Ingest(scenarioBatchSamples(), func(persisted []Sample) error {
+			close(entered)
+			<-release
+			return nil
+		})
+		if err != nil {
+			t.Errorf("ingest during computation: %v", err)
+			return
+		}
+		if result.Created != 11 {
+			t.Errorf("batch created=%d, want 11", result.Created)
+		}
+	}()
+
+	// The batch must reach its durable commit without waiting for the
+	// in-flight segment computation to finish.
+	select {
+	case <-entered:
+	case <-aggDone:
+		t.Fatal("batch commit waited for the in-flight aggregate to finish: computation still blocks ingestion")
+	case <-time.After(30 * time.Second):
+		t.Fatal("batch commit hook never reached")
+	}
+	close(release)
+	<-ingestDone
+
+	overlapping := <-aggDone
+	after, err := s.Aggregate(query)
+	if err != nil {
+		t.Fatalf("aggregate after: %v", err)
+	}
+	if reflect.DeepEqual(before, after) {
+		t.Fatal("pre- and post-batch aggregates must differ")
+	}
+	// Whichever snapshot the overlapping aggregate selected, it must be one
+	// complete committed dataset — never a splice of the two states.
+	if !reflect.DeepEqual(overlapping, before) && !reflect.DeepEqual(overlapping, after) {
+		t.Fatalf("overlapping aggregate must be the complete pre- or post-batch state, got a splice:\n%v",
+			summarizeAggregate(overlapping))
+	}
+}
