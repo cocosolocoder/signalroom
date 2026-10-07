@@ -402,6 +402,56 @@ func TestAggregateOverlappingBatchCommitIsOneSnapshot(t *testing.T) {
 	}
 }
 
+// TestAggregateSelectionSnapshotSurvivesLaterCommit pins the decoupling
+// between reading samples and computing results: once a query has selected
+// its committed data, the store lock is released and a new batch commits
+// immediately, while the in-flight computation still finishes from the
+// pre-batch selection. The batch's late pre-window samples, its brand-new
+// series, and its in-window supplements must not leak into that result; the
+// next query sees the batch's whole effect.
+func TestAggregateSelectionSnapshotSurvivesLaterCommit(t *testing.T) {
+	s := NewStore()
+	query := aggScenarioQuery()
+	if _, err := s.Ingest(scenarioSeedSamples(), nil); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	segments, err := ValidateAggregateQuery(query)
+	if err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	selected, err := s.selectAggregateSeries(query, len(segments))
+	if err != nil {
+		t.Fatalf("select: %v", err)
+	}
+
+	// Selection has already returned, so the store is not held by the
+	// pending computation: the batch commits right away.
+	result, err := s.Ingest(scenarioBatchSamples(), noopCommit)
+	if err != nil {
+		t.Fatalf("ingest after selection: %v", err)
+	}
+	if result.Created != 11 {
+		t.Fatalf("batch created=%d, want 11", result.Created)
+	}
+
+	// The computation over the selected snapshot is the complete pre-batch
+	// state, per series and per segment — not a mix with the post-batch
+	// state even though both grand totals are 100.
+	computed, err := computeAggregate(selected, segments, query)
+	if err != nil {
+		t.Fatalf("compute from snapshot: %v", err)
+	}
+	assertScenarioResult(t, computed, []string{"1", "2"}, beforeCounts, beforeDeltas)
+
+	// A fresh query selects after the commit and reflects the whole batch.
+	after, err := s.Aggregate(query)
+	if err != nil {
+		t.Fatalf("aggregate after: %v", err)
+	}
+	assertScenarioResult(t, after, []string{"1", "2", "3"}, afterCounts, afterDeltas)
+}
+
 // TestAggregateUnchangedAfterConflictBatch covers the 409 contract for
 // aggregation: one sample with a different id claiming a stored series at the
 // same absolute instant rejects the whole batch, so none of its other valid

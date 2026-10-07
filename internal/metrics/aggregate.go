@@ -3,6 +3,7 @@ package metrics
 import (
 	"errors"
 	"math"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -64,24 +65,78 @@ var (
 )
 
 // Aggregate computes per-series sample counts and cumulative deltas over the
-// query window using a single read of the store, so every series and segment
-// reflects one committed snapshot. Late arrivals are bucketed by their own
-// sample time, so an unchanged dataset always yields the same result
-// regardless of ingestion order.
+// query window from one committed snapshot of the store. Selection runs under
+// a single read lock: the matching series are picked and the samples the
+// computation needs — the in-window points plus each series' nearest
+// pre-window predecessor — are copied out. The segment math then runs after
+// the lock is released, so a slow aggregation never blocks new batches from
+// committing; those batches simply belong to the next query's snapshot. Late
+// arrivals are bucketed by their own sample time, so an unchanged dataset
+// always yields the same result regardless of ingestion order.
 func (s *Store) Aggregate(query AggregateQuery) ([]AggregateSeries, error) {
 	segments, err := ValidateAggregateQuery(query)
 	if err != nil {
 		return nil, err
 	}
 
+	selected, err := s.selectAggregateSeries(query, len(segments))
+	if err != nil {
+		return nil, err
+	}
+	return computeAggregate(selected, segments, query)
+}
+
+// computeAggregate fills one copy of the segment skeleton per selected series
+// from the snapshots. It touches no store state and holds no lock, so it can
+// run while new batches commit; those batches belong to later selections.
+func computeAggregate(selected []seriesSnapshot, segments []AggregateSegment, query AggregateQuery) ([]AggregateSeries, error) {
+	out := make([]AggregateSeries, 0, len(selected))
+	var grandTotal float64
+	for _, snap := range selected {
+		seriesSegs := append([]AggregateSegment(nil), segments...)
+		total, err := fillSeries(seriesSegs, snap, query)
+		if err != nil {
+			return nil, err
+		}
+		grandTotal += total
+		if !isFinite(grandTotal) {
+			return nil, ErrDeltaNotFinite
+		}
+		out = append(out, AggregateSeries{
+			Service:  snap.key.service,
+			Labels:   snap.labels,
+			Segments: seriesSegs,
+		})
+	}
+	return out, nil
+}
+
+// seriesSnapshot is one matching series' committed state, copied under the
+// store lock so the segment computation can run after the lock is released.
+// points holds the in-window points [Since, Until) in time order; prev is the
+// nearest sample strictly before the window, which the first in-window sample
+// needs as its predecessor reading.
+type seriesSnapshot struct {
+	key     seriesKey
+	labels  map[string]string
+	points  []point
+	prev    float64
+	hasPrev bool
+}
+
+// selectAggregateSeries picks the series matching the query that actually
+// have a sample in the half-open window, in a stable order (service, then
+// full label set), and copies the points the delta computation needs out of
+// the store. It runs entirely under the read lock, so the returned snapshots
+// all reflect the same committed dataset; samples committed afterwards are
+// invisible to this selection and belong to later queries.
+func (s *Store) selectAggregateSeries(query AggregateQuery, segmentCount int) ([]seriesSnapshot, error) {
 	name := strings.TrimSpace(query.Name)
 	service := strings.TrimSpace(query.Service)
 
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	// Select the matching series that actually have a sample in the
-	// half-open window, in a stable order (service, then full label set).
 	keys := make([]seriesKey, 0, len(s.series))
 	for key, state := range s.series {
 		if key.name != name {
@@ -105,28 +160,34 @@ func (s *Store) Aggregate(query AggregateQuery) ([]AggregateSeries, error) {
 		return keys[i].labels < keys[j].labels
 	})
 
-	if len(keys)*len(segments) > MaxAggregateSeriesSegments {
+	if len(keys)*segmentCount > MaxAggregateSeriesSegments {
 		return nil, ErrTooManySeriesSegments
 	}
 
-	out := make([]AggregateSeries, 0, len(keys))
-	var grandTotal float64
+	out := make([]seriesSnapshot, 0, len(keys))
 	for _, key := range keys {
 		state := s.series[key]
-		seriesSegs := append([]AggregateSegment(nil), segments...)
-		total, err := fillSeries(seriesSegs, state.points, query)
-		if err != nil {
-			return nil, err
-		}
-		grandTotal += total
-		if !isFinite(grandTotal) {
-			return nil, ErrDeltaNotFinite
-		}
-		out = append(out, AggregateSeries{
-			Service:  key.service,
-			Labels:   state.labels,
-			Segments: seriesSegs,
+		// First point at or after the window start; the point just before it
+		// is the predecessor the first in-window sample computes against, so
+		// it must be copied even though it lies outside the window.
+		first := sort.Search(len(state.points), func(i int) bool {
+			return !state.points[i].at.Before(query.Since)
 		})
+		// First point at or after the window end; it and anything later is
+		// excluded, so the copy stops here.
+		end := sort.Search(len(state.points), func(i int) bool {
+			return !state.points[i].at.Before(query.Until)
+		})
+		snap := seriesSnapshot{
+			key:    key,
+			labels: state.labels,
+			points: slices.Clone(state.points[first:end]),
+		}
+		if first > 0 {
+			snap.prev = state.points[first-1].value
+			snap.hasPrev = true
+		}
+		out = append(out, snap)
 	}
 	return out, nil
 }
@@ -183,37 +244,25 @@ func (st *seriesState) hasPointBetween(since, until time.Time) bool {
 	return idx < len(st.points) && st.points[idx].at.Before(until)
 }
 
-// fillSeries counts samples per segment and attributes cumulative deltas.
-// The nearest sample strictly before the window start acts as the first
-// in-window sample's predecessor; a sample with no predecessor anywhere
-// contributes no delta. A value that does not move backwards contributes the
-// difference; a backwards move is a counter reset and contributes the current
-// value. Every delta lands in the segment containing the later sample; the
-// sample at the window end never participates. It returns the series' total
-// delta so the caller can fail the whole query when no finite grand total
-// exists.
-func fillSeries(segments []AggregateSegment, points []point, query AggregateQuery) (float64, error) {
+// fillSeries counts samples per segment and attributes cumulative deltas for
+// one snapshotted series. The snapshot's predecessor — the nearest sample
+// strictly before the window start — acts as the first in-window sample's
+// predecessor reading; a sample with no predecessor anywhere contributes no
+// delta. A value that does not move backwards contributes the difference; a
+// backwards move is a counter reset and contributes the current value. Every
+// delta lands in the segment containing the later sample; the snapshot holds
+// only in-window points, so the sample at the window end never participates.
+// It returns the series' total delta so the caller can fail the whole query
+// when no finite grand total exists.
+func fillSeries(segments []AggregateSegment, snap seriesSnapshot, query AggregateQuery) (float64, error) {
 	step := query.Step
 
-	// First point at or after the window start.
-	first := sort.Search(len(points), func(i int) bool {
-		return !points[i].at.Before(query.Since)
-	})
-
-	var prevValue, total float64
-	hasPrev := false
-	if first > 0 {
-		prevValue = points[first-1].value
-		hasPrev = true
-	}
-
-	for _, p := range points[first:] {
-		if !p.at.Before(query.Until) {
-			break // at == until and anything later is excluded
-		}
+	prevValue, hasPrev := snap.prev, snap.hasPrev
+	var total float64
+	for _, p := range snap.points {
 		idx := int(p.at.Sub(query.Since) / step)
 		if idx >= len(segments) {
-			idx = len(segments) - 1 // defensive; excluded end keeps this in range
+			idx = len(segments) - 1 // defensive; the clipped final segment keeps this in range
 		}
 		segments[idx].Count++
 
