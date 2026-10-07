@@ -27,10 +27,20 @@ type IncidentLog struct {
 // complete frame containing illegal data, is fatal and leaves the file
 // untouched. Call it only after Open has acquired the directory lock.
 func OpenIncidentLog(dir string) (*IncidentLog, []incidents.Record, error) {
+	return OpenIncidentLogChecked(dir, nil)
+}
+
+// OpenIncidentLogChecked is OpenIncidentLog with an additional validation of
+// the recovered records. The check runs after replay and before any torn
+// tail is truncated, so a rejection — for example a complete record whose
+// handover breaks the personnel rules — is fatal and leaves the file
+// byte-for-byte intact, incomplete trailing frame included. Only a log that
+// passes the check may have its one incomplete trailing frame dropped.
+func OpenIncidentLogChecked(dir string, check func(records []incidents.Record) error) (*IncidentLog, []incidents.Record, error) {
 	if dir == "" {
 		return nil, nil, fmt.Errorf("data directory is required")
 	}
-	base, records, err := openFrameLog(dir, incidentLogName, "incident", "incident record", incidents.DecodeRecord, nil)
+	base, records, err := openFrameLog(dir, incidentLogName, "incident", "incident record", incidents.DecodeRecord, check)
 	if err != nil {
 		return nil, nil, err
 	}

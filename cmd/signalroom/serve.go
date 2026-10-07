@@ -48,13 +48,29 @@ func runServe(args []string) error {
 	timeline.SortAll()
 
 	// Incidents are replayed after events so linked event ids resolve
-	// against the already-recovered timeline.
-	incidentLog, incidentRecords, err := logfile.OpenIncidentLog(*dataDir)
+	// against the already-recovered timeline. The records are validated by
+	// replaying them into a probe registry before the log may trim a torn
+	// tail: an illegal record (for example a handover to a non-participant
+	// or to the current owner) must abort startup with the log left
+	// byte-for-byte intact, incomplete trailing frame included.
+	validateRecords := func(records []incidents.Record) error {
+		probe := incidents.NewRegistry(timeline, nil)
+		for _, record := range records {
+			if err := probe.Load(record); err != nil {
+				return fmt.Errorf("recover incidents: %w", err)
+			}
+		}
+		return nil
+	}
+	incidentLog, incidentRecords, err := logfile.OpenIncidentLogChecked(*dataDir, validateRecords)
 	if err != nil {
 		return err
 	}
 	defer incidentLog.Close()
 
+	// The records passed validation above, so this replay into the serving
+	// registry cannot fail; it is kept as the safety net that turns any
+	// divergence between the two paths into a startup error.
 	registry := incidents.NewRegistry(timeline, incidentLog.AppendRecord)
 	for _, record := range incidentRecords {
 		if err := registry.Load(record); err != nil {
