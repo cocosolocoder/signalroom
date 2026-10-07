@@ -31,7 +31,7 @@ func openIncidentForTest(t *testing.T, dir string) (*Log, *IncidentLog, []incide
 	if err != nil {
 		t.Fatalf("open dir: %v", err)
 	}
-	incLog, records, err := OpenIncidentLog(dir)
+	incLog, records, err := OpenIncidentLog(dir, nil)
 	if err != nil {
 		t.Fatalf("open incident log: %v", err)
 	}
@@ -173,7 +173,7 @@ func TestIncidentLogMidCorruptionFails(t *testing.T) {
 		t.Fatalf("event log should still open: %v", err)
 	}
 	defer eventLog2.Close()
-	if _, _, err := OpenIncidentLog(dir); err == nil {
+	if _, _, err := OpenIncidentLog(dir, nil); err == nil {
 		t.Fatal("corrupt incident log must fail startup")
 	}
 

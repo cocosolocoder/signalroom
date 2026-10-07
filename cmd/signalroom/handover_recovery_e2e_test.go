@@ -238,6 +238,245 @@ func TestServeFailsOnIllegalHandoverRecordWithoutMutation(t *testing.T) {
 	})
 }
 
+// TestServeFailsOnIllegalHandoverBeforeTrimmingTornTail covers the
+// accident-history protection regression: a complete illegal handover
+// record (here: the target had not joined when the handover happened; the
+// same-named person only joins in a later frame) followed by an unfinished
+// trailing write. Recovery used to drop the tail first and then abort on the
+// handover, destroying the original evidence. Startup must instead: exit
+// non-zero without announcing readiness, report the handover reason and the
+// target name rather than the incomplete tail, and preserve the whole log
+// byte for byte — the bad record, the complete later records, and the torn
+// tail, whether the tail is a partial header or a header with a truncated
+// payload.
+func TestServeFailsOnIllegalHandoverBeforeTrimmingTornTail(t *testing.T) {
+	stamp := func(sec int) time.Time {
+		return time.Date(2026, 10, 1, 12, 0, 0, sec, time.UTC)
+	}
+	frame := func(t *testing.T, record incidents.Record) []byte {
+		t.Helper()
+		payload, err := incidents.MarshalRecord(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := make([]byte, 8+len(payload))
+		binary.BigEndian.PutUint32(out[0:4], uint32(len(payload)))
+		binary.BigEndian.PutUint32(out[4:8], crc32.ChecksumIEEE(payload))
+		copy(out[8:], payload)
+		return out
+	}
+
+	tails := []struct {
+		name     string
+		makeTail func(t *testing.T) []byte
+	}{
+		{
+			name: "partial record header",
+			makeTail: func(t *testing.T) []byte {
+				return []byte{0x00, 0x00, 0x01}
+			},
+		},
+		{
+			name: "complete header with a truncated payload",
+			makeTail: func(t *testing.T) []byte {
+				payload, err := incidents.MarshalRecord(incidents.NewActionRecord(incidents.Request{
+					IncidentID: "INC-8", ActionID: "p9", Operator: "alice",
+					ExpectedVersion: 5, Type: incidents.ActionAddParticipant, Content: "erin",
+				}, stamp(6)))
+				if err != nil {
+					t.Fatal(err)
+				}
+				torn := make([]byte, 8+4)
+				binary.BigEndian.PutUint32(torn[0:4], uint32(len(payload)))
+				binary.BigEndian.PutUint32(torn[4:8], crc32.ChecksumIEEE(payload))
+				copy(torn[8:], payload[:4])
+				return torn
+			},
+		},
+	}
+
+	for _, tailCase := range tails {
+		t.Run(tailCase.name, func(t *testing.T) {
+			dataDir := t.TempDir()
+			first := startServer(t, dataDir)
+			postIncident(t, first, `{"id":"INC-8","title":"t","service":"gateway","operator":"Alice"}`)
+			if s, _ := postIncidentAction(t, first, "INC-8",
+				`{"action_id":"p1","operator":"alice","expected_version":1,"action":"add_participant","participant":"bob"}`); s != http.StatusOK {
+				t.Fatalf("add bob status %d", s)
+			}
+			first.signal(t, syscall.SIGKILL)
+			first.waitExit(t, -1)
+			waitTCPPortClosed(t, first.addr)
+
+			path := filepath.Join(dataDir, "incidents.log")
+			existing, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			// Complete, well-formed frames. The handover names carol while
+			// carol only joins two records later, so the handover is illegal
+			// against the history that precedes it and the later join cannot
+			// legitimize it. The note and a second incident's creation are
+			// independently complete records that must also be preserved.
+			bad := incidents.NewActionRecord(incidents.Request{
+				IncidentID: "INC-8", ActionID: "o1", Operator: "alice",
+				ExpectedVersion: 2, Type: incidents.ActionAssignOwner, Content: "carol",
+			}, stamp(1))
+			addCarol := incidents.NewActionRecord(incidents.Request{
+				IncidentID: "INC-8", ActionID: "p2", Operator: "alice",
+				ExpectedVersion: 3, Type: incidents.ActionAddParticipant, Content: "carol",
+			}, stamp(2))
+			note := incidents.NewActionRecord(incidents.Request{
+				IncidentID: "INC-8", ActionID: "n1", Operator: "alice",
+				ExpectedVersion: 4, Type: incidents.ActionNote, Content: "after the bad handover",
+			}, stamp(3))
+			otherIncident := incidents.NewCreationRecord(incidents.Creation{
+				ID: "INC-9", Title: "t", Service: "gateway", Operator: "dora",
+			}, stamp(4))
+
+			content := append([]byte{}, existing...)
+			for _, record := range []incidents.Record{bad, addCarol, note, otherIncident} {
+				content = append(content, frame(t, record)...)
+			}
+			content = append(content, tailCase.makeTail(t)...)
+			wantBytes := append([]byte{}, content...)
+			if err := os.WriteFile(path, content, 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			expectServeFailsOnIncidentLog(t, dataDir, wantBytes, path,
+				"recover incidents", "non-participant", `"carol"`)
+
+			// The error must not merely describe the unfinished tail.
+			logs := runServeExpectFailure(t, dataDir)
+			if strings.Contains(logs, "trailing") || strings.Contains(logs, "truncate") {
+				t.Fatalf("startup must report the handover, not the torn tail:\n%s", logs)
+			}
+
+			// Repeated starts keep failing with the same intact log.
+			expectServeFailsOnIncidentLog(t, dataDir, wantBytes, path,
+				"recover incidents", "non-participant", `"carol"`)
+		})
+	}
+}
+
+// TestServeLegalHandoverHistoryWithTornTailRecovers pins the compatible
+// recovery path: when the complete history is legal and only one unfinished
+// write trails it, startup proceeds, drops just that tail, and rebuilds the
+// incident to the last complete legal record — owner, participants, version,
+// and history untouched by the discarded frame.
+func TestServeLegalHandoverHistoryWithTornTailRecovers(t *testing.T) {
+	dataDir := t.TempDir()
+	first := startServer(t, dataDir)
+	postIncident(t, first, `{"id":"INC-8","title":"t","service":"gateway","operator":"Alice"}`)
+	if s, _ := postIncidentAction(t, first, "INC-8",
+		`{"action_id":"p1","operator":"alice","expected_version":1,"action":"add_participant","participant":"bob"}`); s != http.StatusOK {
+		t.Fatalf("add bob status %d", s)
+	}
+	if s, _ := postIncidentAction(t, first, "INC-8",
+		`{"action_id":"o1","operator":"alice","expected_version":2,"action":"assign_owner","participant":"bob"}`); s != http.StatusOK {
+		t.Fatalf("assign bob status %d", s)
+	}
+	first.signal(t, syscall.SIGKILL)
+	first.waitExit(t, -1)
+	waitTCPPortClosed(t, first.addr)
+
+	path := filepath.Join(dataDir, "incidents.log")
+	existing, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Unfinished fourth record (carol never joins): complete header,
+	// truncated payload.
+	payload, err := incidents.MarshalRecord(incidents.NewActionRecord(incidents.Request{
+		IncidentID: "INC-8", ActionID: "p2", Operator: "alice",
+		ExpectedVersion: 3, Type: incidents.ActionAddParticipant, Content: "carol",
+	}, time.Date(2026, 10, 1, 12, 0, 5, 0, time.UTC)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	torn := make([]byte, 8+4)
+	binary.BigEndian.PutUint32(torn[0:4], uint32(len(payload)))
+	binary.BigEndian.PutUint32(torn[4:8], crc32.ChecksumIEEE(payload))
+	copy(torn[8:], payload[:4])
+	if err := os.WriteFile(path, append(existing, torn...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	second := startServer(t, dataDir)
+	status, got := getIncident(t, second, "INC-8")
+	if status != http.StatusOK {
+		t.Fatalf("legal history must survive a torn tail: %d", status)
+	}
+	if incNumber(got["version"]) != 3 {
+		t.Fatalf("state must stop at the last complete record (version 3): %v", got["version"])
+	}
+	if got["owner"] != "bob" {
+		t.Fatalf("owner must come from the complete handover: %v", got["owner"])
+	}
+	members, _ := got["participants"].([]any)
+	if len(members) != 2 || members[0] != "Alice" || members[1] != "bob" {
+		t.Fatalf("the torn add_participant must not take effect: %v", got["participants"])
+	}
+	history, _ := got["history"].([]any)
+	if len(history) != 3 {
+		t.Fatalf("history must end with the handover, got %d entries", len(history))
+	}
+	last := history[2].(map[string]any)
+	if last["action"] != "assign_owner" || last["content"] != "bob" || incNumber(last["version"]) != 3 {
+		t.Fatalf("last history entry must be the complete handover: %v", last)
+	}
+
+	// The tail is gone; the next successful write lands at the trimmed end.
+	if s, c := postIncidentAction(t, second, "INC-8",
+		`{"action_id":"n2","operator":"bob","expected_version":3,"action":"add_note","content":"after recovery"}`); s != http.StatusOK || incNumber(c["version"]) != 4 {
+		t.Fatalf("write after recovery %d %v", s, c)
+	}
+	second.signal(t, syscall.SIGTERM)
+	second.waitExit(t, 0)
+
+	// A third start sees the complete post-trim write and nothing of carol.
+	third := startServer(t, dataDir)
+	if s, again := getIncident(t, third, "INC-8"); s != http.StatusOK || incNumber(again["version"]) != 4 ||
+		again["owner"] != "bob" {
+		t.Fatalf("post-recovery state must survive another restart: %d %v", s, again)
+	}
+	third.signal(t, syscall.SIGTERM)
+	third.waitExit(t, 0)
+}
+
+// runServeExpectFailure starts serve on dataDir, waits for its non-zero
+// exit, and returns everything it printed, so a test can assert the failure
+// was attributed to the handover rather than the incomplete tail.
+func runServeExpectFailure(t *testing.T, dataDir string) string {
+	t.Helper()
+	logs := &safeBuffer{}
+	proc := exec.Command(binaryPath, "serve", "--addr", "127.0.0.1:0", "--data", dataDir)
+	proc.Stdout = logs
+	proc.Stderr = logs
+	if err := proc.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- proc.Wait() }()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	select {
+	case err := <-done:
+		if ee, ok := err.(*exec.ExitError); !ok || ee.ExitCode() == 0 {
+			t.Fatalf("startup must exit non-zero: %v", err)
+		}
+	case <-ctx.Done():
+		proc.Process.Kill()
+		t.Fatalf("server stayed up; output:\n%s", logs.String())
+	}
+	if strings.Contains(logs.String(), "listening on") {
+		t.Fatalf("failed startup must not announce readiness:\n%s", logs.String())
+	}
+	return logs.String()
+}
+
 // expectServeFailsOnIncidentLog runs serve against dataDir, requires a
 // non-zero exit without a readiness line, checks that the startup error
 // contains every want fragment, and verifies the incident log file is

@@ -48,10 +48,13 @@ func runServe(args []string) error {
 	timeline.SortAll()
 
 	// Incidents are replayed after events so linked event ids resolve
-	// against the already-recovered timeline.
-	incidentLog, incidentRecords, err := logfile.OpenIncidentLog(*dataDir)
+	// against the already-recovered timeline. OpenIncidentLog itself
+	// replays the complete records once more (before trimming a torn tail)
+	// so that a history contradicting the handover or other rules fails
+	// startup without a single byte of the log being dropped.
+	incidentLog, incidentRecords, err := logfile.OpenIncidentLog(*dataDir, timeline)
 	if err != nil {
-		return err
+		return fmt.Errorf("recover incidents: %w", err)
 	}
 	defer incidentLog.Close()
 
